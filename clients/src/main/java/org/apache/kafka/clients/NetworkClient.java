@@ -12,22 +12,13 @@
  */
 package org.apache.kafka.clients;
 
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.Set;
-
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.network.NetworkReceive;
 import org.apache.kafka.common.network.Selectable;
 import org.apache.kafka.common.network.Send;
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.protocol.ProtoUtils;
 import org.apache.kafka.common.protocol.types.Struct;
 import org.apache.kafka.common.requests.MetadataRequest;
@@ -39,6 +30,14 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
 
 /**
  * A network client for asynchronous request/response network i/o. This is an internal class used to implement the
@@ -52,15 +51,11 @@ public class NetworkClient implements KafkaClient {
 
     /* the selector used to perform network i/o */
     private final Selectable selector;
-    
+
     private final MetadataUpdater metadataUpdater;
-    
-    /* a list of nodes we've connected to in the past */
-    private final List<Integer> nodesEverSeen;
-    private final Map<Integer, Node> nodesEverSeenById;
-    /* random offset into nodesEverSeen list */
+
     private final Random randOffset;
-    
+
     /* the state of each node's connection */
     private final ClusterConnectionStates connectionStates;
 
@@ -76,15 +71,12 @@ public class NetworkClient implements KafkaClient {
     /* the client id used to identify this client in requests to the server */
     private final String clientId;
 
-    /* a random offset to use when choosing nodes to avoid having all nodes choose the same node */
-    private final int nodeIndexOffset;
-
     /* the current correlation id to use when sending requests to servers */
     private int correlation;
 
     /* max time in ms for the producer to wait for acknowledgement from server*/
     private final int requestTimeoutMs;
-    
+
     private final Time time;
 
     public NetworkClient(Selectable selector,
@@ -120,7 +112,7 @@ public class NetworkClient implements KafkaClient {
                           int maxInFlightRequestsPerConnection,
                           long reconnectBackoffMs,
                           int socketSendBuffer,
-                          int socketReceiveBuffer, 
+                          int socketReceiveBuffer,
                           int requestTimeoutMs,
                           Time time) {
 
@@ -143,11 +135,7 @@ public class NetworkClient implements KafkaClient {
         this.socketReceiveBuffer = socketReceiveBuffer;
         this.correlation = 0;
         this.randOffset = new Random();
-        this.nodeIndexOffset = this.randOffset.nextInt(Integer.MAX_VALUE);
         this.requestTimeoutMs = requestTimeoutMs;
-        this.nodesEverSeen = new ArrayList<>();
-        this.nodesEverSeenById = new HashMap<>();
-        
         this.time = time;
     }
 
@@ -160,6 +148,9 @@ public class NetworkClient implements KafkaClient {
      */
     @Override
     public boolean ready(Node node, long now) {
+        if (node.isEmpty())
+            throw new IllegalArgumentException("Cannot connect to empty node " + node);
+
         if (isReady(node, now))
             return true;
 
@@ -234,16 +225,6 @@ public class NetworkClient implements KafkaClient {
     }
 
     /**
-     * Return the state of the connection to the given node
-     *
-     * @param node The node to check
-     * @return The connection state
-     */
-    public ConnectionState connectionState(String node) {
-        return connectionStates.connectionState(node);
-    }
-
-    /**
      * Queue up the given request for sending. Requests can only be sent out to ready nodes.
      *
      * @param request The request
@@ -275,15 +256,14 @@ public class NetworkClient implements KafkaClient {
     @Override
     public List<ClientResponse> poll(long timeout, long now) {
         long metadataTimeout = metadataUpdater.maybeUpdate(now);
-        long updatedNow = now;
         try {
             this.selector.poll(Utils.min(timeout, metadataTimeout, requestTimeoutMs));
         } catch (IOException e) {
-            log.error("Unexpected error during I/O in producer network thread", e);
+            log.error("Unexpected error during I/O", e);
         }
 
         // process completed actions
-        updatedNow = this.time.milliseconds();
+        long updatedNow = this.time.milliseconds();
         List<ClientResponse> responses = new ArrayList<>();
         handleCompletedSends(responses, updatedNow);
         handleCompletedReceives(responses, updatedNow);
@@ -373,8 +353,10 @@ public class NetworkClient implements KafkaClient {
         List<Node> nodes = this.metadataUpdater.fetchNodes();
         int inflight = Integer.MAX_VALUE;
         Node found = null;
+
+        int offset = this.randOffset.nextInt(nodes.size());
         for (int i = 0; i < nodes.size(); i++) {
-            int idx = Utils.abs((this.nodeIndexOffset + i) % nodes.size());
+            int idx = (offset + i) % nodes.size();
             Node node = nodes.get(idx);
             int currInflight = this.inFlightRequests.inFlightRequestCount(node.idString());
             if (currInflight == 0 && this.connectionStates.isConnected(node.idString())) {
@@ -387,20 +369,17 @@ public class NetworkClient implements KafkaClient {
             }
         }
 
-        // if we found no node in the current list, try one from the nodes seen before
-        if (found == null && nodesEverSeen.size() > 0) {
-            int offset = randOffset.nextInt(nodesEverSeen.size());
-            for (int i = 0; i < nodesEverSeen.size(); i++) {
-                int idx = Utils.abs((offset + i) % nodesEverSeen.size());
-                Node node = nodesEverSeenById.get(nodesEverSeen.get(idx));
-                log.debug("No node found. Trying previously-seen node with ID {}", node.id());
-                if (!this.connectionStates.isBlackedOut(node.idString(), now)) {
-                    found = node;
-                }
-            }
-        }
-        
         return found;
+    }
+
+    public static Struct parseResponse(ByteBuffer responseBuffer, RequestHeader requestHeader) {
+        ResponseHeader responseHeader = ResponseHeader.parse(responseBuffer);
+        // Always expect the response version id to be the same as the request version id
+        short apiKey = requestHeader.apiKey();
+        short apiVer = requestHeader.apiVersion();
+        Struct responseBody = ProtoUtils.responseSchema(apiKey, apiVer).read(responseBuffer);
+        correlate(requestHeader, responseHeader);
+        return responseBody;
     }
 
     /**
@@ -420,7 +399,7 @@ public class NetworkClient implements KafkaClient {
     }
 
     /**
-     * Iterate over all the inflight requests and expire any requests that have exceeded the configured the requestTimeout.
+     * Iterate over all the inflight requests and expire any requests that have exceeded the configured requestTimeout.
      * The connection to the node associated with the request will be terminated and will be treated as a disconnection.
      *
      * @param responses The list of responses to update
@@ -467,10 +446,7 @@ public class NetworkClient implements KafkaClient {
         for (NetworkReceive receive : this.selector.completedReceives()) {
             String source = receive.source();
             ClientRequest req = inFlightRequests.completeNext(source);
-            ResponseHeader header = ResponseHeader.parse(receive.payload());
-            short apiKey = req.request().header().apiKey();
-            Struct body = (Struct) ProtoUtils.currentResponseSchema(apiKey).read(receive.payload());
-            correlate(req.request().header(), header);
+            Struct body = parseResponse(receive.payload(), req.request().header());
             if (!metadataUpdater.maybeHandleCompletedReceive(req, now, body))
                 responses.add(new ClientResponse(req, now, false, body));
         }
@@ -505,7 +481,7 @@ public class NetworkClient implements KafkaClient {
     /**
      * Validate that the response corresponds to the request we expect or else explode
      */
-    private void correlate(RequestHeader requestHeader, ResponseHeader responseHeader) {
+    private static void correlate(RequestHeader requestHeader, ResponseHeader responseHeader) {
         if (requestHeader.correlationId() != responseHeader.correlationId())
             throw new IllegalStateException("Correlation id for response (" + responseHeader.correlationId()
                     + ") does not match request (" + requestHeader.correlationId() + ")");
@@ -568,7 +544,7 @@ public class NetworkClient implements KafkaClient {
             // if there is no node available to connect, back off refreshing metadata
             long metadataTimeout = Math.max(Math.max(timeToNextMetadataUpdate, timeToNextReconnectAttempt),
                     waitForMetadataFetch);
- 
+
             if (metadataTimeout == 0) {
                 // Beware that the behavior of this method and the computation of timeouts for poll() are
                 // highly dependent on the behavior of leastLoadedNode.
@@ -584,6 +560,14 @@ public class NetworkClient implements KafkaClient {
             ApiKeys requestKey = ApiKeys.forId(request.request().header().apiKey());
 
             if (requestKey == ApiKeys.METADATA) {
+                Cluster cluster = metadata.fetch();
+                if (cluster.isBootstrapConfigured()) {
+                    int nodeId = Integer.parseInt(request.request().destination());
+                    Node node = cluster.nodeById(nodeId);
+                    if (node != null)
+                        log.warn("Bootstrap broker {}:{} disconnected", node.host(), node.port());
+                }
+
                 metadataFetchInProgress = false;
                 return true;
             }
@@ -606,42 +590,19 @@ public class NetworkClient implements KafkaClient {
             this.metadata.requestUpdate();
         }
 
-        /*
-         * Keep track of any nodes we've ever seen. Add current
-         * alive nodes to this tracking list. 
-         * @param nodes Current alive nodes
-         */
-        private void updateNodesEverSeen(List<Node> nodes) {
-            Node existing = null;
-            for (Node n : nodes) {
-                existing = nodesEverSeenById.get(n.id());
-                if (existing == null) {
-                    nodesEverSeenById.put(n.id(), n);
-                    log.debug("Adding node {} to nodes ever seen", n.id());
-                    nodesEverSeen.add(n.id());
-                } else {
-                    // check if the nodes are really equal. There could be a case
-                    // where node.id() is the same but node has moved to different host
-                    if (!existing.equals(n)) {
-                        nodesEverSeenById.put(n.id(), n);
-                    }
-                }
-            }
-        }
-
         private void handleResponse(RequestHeader header, Struct body, long now) {
             this.metadataFetchInProgress = false;
             MetadataResponse response = new MetadataResponse(body);
             Cluster cluster = response.cluster();
             // check if any topics metadata failed to get updated
-            if (response.errors().size() > 0) {
-                log.warn("Error while fetching metadata with correlation id {} : {}", header.correlationId(), response.errors());
-            }
+            Map<String, Errors> errors = response.errors();
+            if (!errors.isEmpty())
+                log.warn("Error while fetching metadata with correlation id {} : {}", header.correlationId(), errors);
+
             // don't update the cluster if there are no valid nodes...the topic we want may still be in the process of being
             // created which means we will get errors and no nodes until it exists
             if (cluster.nodes().size() > 0) {
                 this.metadata.update(cluster, now);
-                this.updateNodesEverSeen(cluster.nodes());
             } else {
                 log.trace("Ignoring empty metadata response with correlation id {}.", header.correlationId());
                 this.metadata.failedUpdate(now);
@@ -651,8 +612,7 @@ public class NetworkClient implements KafkaClient {
         /**
          * Create a metadata request for the given topics
          */
-        private ClientRequest request(long now, String node, Set<String> topics) {
-            MetadataRequest metadata = new MetadataRequest(new ArrayList<>(topics));
+        private ClientRequest request(long now, String node, MetadataRequest metadata) {
             RequestSend send = new RequestSend(node, nextRequestHeader(ApiKeys.METADATA), metadata.toStruct());
             return new ClientRequest(now, true, send, null, true);
         }
@@ -670,11 +630,15 @@ public class NetworkClient implements KafkaClient {
             String nodeConnectionId = node.idString();
 
             if (canSendRequest(nodeConnectionId)) {
-                Set<String> topics = metadata.needMetadataForAllTopics() ? new HashSet<String>() : metadata.topics();
                 this.metadataFetchInProgress = true;
-                ClientRequest metadataRequest = request(now, nodeConnectionId, topics);
+                MetadataRequest metadataRequest;
+                if (metadata.needMetadataForAllTopics())
+                    metadataRequest = MetadataRequest.allTopics();
+                else
+                    metadataRequest = new MetadataRequest(new ArrayList<>(metadata.topics()));
+                ClientRequest clientRequest = request(now, nodeConnectionId, metadataRequest);
                 log.debug("Sending metadata request {} to node {}", metadataRequest, node.id());
-                doSend(metadataRequest, now);
+                doSend(clientRequest, now);
             } else if (connectionStates.canConnect(nodeConnectionId, now)) {
                 // we don't have a connection to this node right now, make one
                 log.debug("Initialize connection to node {} for sending metadata request", node.id());

@@ -23,6 +23,13 @@ import kafka.utils.nonthreadsafe
 
 import scala.collection.Map
 
+
+case class MemberSummary(memberId: String,
+                         clientId: String,
+                         clientHost: String,
+                         metadata: Array[Byte],
+                         assignment: Array[Byte])
+
 /**
  * Member metadata contains the following metadata:
  *
@@ -46,10 +53,13 @@ import scala.collection.Map
 @nonthreadsafe
 private[coordinator] class MemberMetadata(val memberId: String,
                                           val groupId: String,
+                                          val clientId: String,
+                                          val clientHost: String,
                                           val sessionTimeoutMs: Int,
+                                          val protocolType: String,
                                           var supportedProtocols: List[(String, Array[Byte])]) {
 
-  var assignment: Array[Byte] = null
+  var assignment: Array[Byte] = Array.empty[Byte]
   var awaitingJoinCallback: JoinGroupResult => Unit = null
   var awaitingSyncCallback: (Array[Byte], Short) => Unit = null
   var latestHeartbeat: Long = -1
@@ -81,7 +91,15 @@ private[coordinator] class MemberMetadata(val memberId: String,
       if (p1._1 != p2._1 || !util.Arrays.equals(p1._2, p2._2))
         return false
     }
-    return true
+    true
+  }
+
+  def summary(protocol: String): MemberSummary = {
+    MemberSummary(memberId, clientId, clientHost, metadata(protocol), assignment)
+  }
+
+  def summaryNoMetadata(): MemberSummary = {
+    MemberSummary(memberId, clientId, clientHost, Array.empty[Byte], Array.empty[Byte])
   }
 
   /**
@@ -96,4 +114,7 @@ private[coordinator] class MemberMetadata(val memberId: String,
     }
   }
 
+  override def toString = {
+    "[%s,%s,%s,%d]".format(memberId, clientId, clientHost, sessionTimeoutMs)
+  }
 }

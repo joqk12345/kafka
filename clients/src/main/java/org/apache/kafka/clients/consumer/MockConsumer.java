@@ -19,6 +19,7 @@ import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -30,8 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
-import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 /**
  * A mock of the {@link Consumer} interface you can use for testing code that uses Kafka. This class is <i> not
@@ -66,7 +67,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
         this.exception = null;
         this.wakeup = new AtomicBoolean(false);
     }
-    
+
     @Override
     public Set<TopicPartition> assignment() {
         return this.subscriptions.assignedPartitions();
@@ -76,7 +77,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     public void rebalance(Collection<TopicPartition> newAssignment) {
         // TODO: Rebalance callbacks
         this.records.clear();
-        this.subscriptions.changePartitionAssignment(newAssignment);
+        this.subscriptions.assignFromSubscribed(newAssignment);
     }
 
     @Override
@@ -85,7 +86,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     }
 
     @Override
-    public void subscribe(List<String> topics) {
+    public void subscribe(Collection<String> topics) {
         subscribe(topics, new NoOpConsumerRebalanceListener());
     }
 
@@ -104,15 +105,15 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     }
 
     @Override
-    public void subscribe(List<String> topics, final ConsumerRebalanceListener listener) {
+    public void subscribe(Collection<String> topics, final ConsumerRebalanceListener listener) {
         ensureNotClosed();
         this.subscriptions.subscribe(topics, listener);
     }
 
     @Override
-    public void assign(List<TopicPartition> partitions) {
+    public void assign(Collection<TopicPartition> partitions) {
         ensureNotClosed();
-        this.subscriptions.assign(partitions);
+        this.subscriptions.assignFromUser(partitions);
     }
 
     @Override
@@ -135,7 +136,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
 
         if (wakeup.get()) {
             wakeup.set(false);
-            throw new ConsumerWakeupException();
+            throw new WakeupException();
         }
 
         if (exception != null) {
@@ -153,7 +154,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
             if (!subscriptions.isPaused(entry.getKey())) {
                 List<ConsumerRecord<K, V>> recs = entry.getValue();
                 if (!recs.isEmpty())
-                    this.subscriptions.consumed(entry.getKey(), recs.get(recs.size() - 1).offset() + 1);
+                    this.subscriptions.position(entry.getKey(), recs.get(recs.size() - 1).offset() + 1);
             }
         }
 
@@ -228,16 +229,16 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
         ensureNotClosed();
         if (!this.subscriptions.isAssigned(partition))
             throw new IllegalArgumentException("You can only check the position for partitions assigned to this consumer.");
-        Long offset = this.subscriptions.consumed(partition);
+        Long offset = this.subscriptions.position(partition);
         if (offset == null) {
             updateFetchPosition(partition);
-            offset = this.subscriptions.consumed(partition);
+            offset = this.subscriptions.position(partition);
         }
         return offset;
     }
 
     @Override
-    public void seekToBeginning(TopicPartition... partitions) {
+    public void seekToBeginning(Collection<TopicPartition> partitions) {
         ensureNotClosed();
         for (TopicPartition tp : partitions)
             subscriptions.needOffsetReset(tp, OffsetResetStrategy.EARLIEST);
@@ -248,7 +249,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     }
 
     @Override
-    public void seekToEnd(TopicPartition... partitions) {
+    public void seekToEnd(Collection<TopicPartition> partitions) {
         ensureNotClosed();
         for (TopicPartition tp : partitions)
             subscriptions.needOffsetReset(tp, OffsetResetStrategy.LATEST);
@@ -267,11 +268,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     @Override
     public List<PartitionInfo> partitionsFor(String topic) {
         ensureNotClosed();
-        List<PartitionInfo> parts = this.partitions.get(topic);
-        if (parts == null)
-            return Collections.emptyList();
-        else
-            return parts;
+        return this.partitions.get(topic);
     }
 
     @Override
@@ -286,7 +283,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     }
 
     @Override
-    public void pause(TopicPartition... partitions) {
+    public void pause(Collection<TopicPartition> partitions) {
         for (TopicPartition partition : partitions) {
             subscriptions.pause(partition);
             paused.add(partition);
@@ -294,7 +291,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     }
 
     @Override
-    public void resume(TopicPartition... partitions) {
+    public void resume(Collection<TopicPartition> partitions) {
         for (TopicPartition partition : partitions) {
             subscriptions.resume(partition);
             paused.remove(partition);
@@ -368,7 +365,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
             if (offset == null)
                 throw new IllegalStateException("MockConsumer didn't have end offset specified, but tried to seek to end");
         } else {
-            throw new NoOffsetForPartitionException("No offset available");
+            throw new NoOffsetForPartitionException(tp);
         }
         seek(tp, offset);
     }

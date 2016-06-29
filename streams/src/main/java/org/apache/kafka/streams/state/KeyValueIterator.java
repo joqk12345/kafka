@@ -19,11 +19,22 @@
 
 package org.apache.kafka.streams.state;
 
+import org.apache.kafka.streams.KeyValue;
+
 import java.io.Closeable;
 import java.util.Iterator;
 
-public interface KeyValueIterator<K, V> extends Iterator<Entry<K, V>>, Closeable {
+/**
+ * Iterator interface of {@link KeyValue}.
+ *
+ * Users need to call its {@code close} method explicitly upon completeness to release resources,
+ * or use try-with-resources statement (available since JDK7) for this {@link Closeable} class.
+ *
+ * @param <K> Type of keys
+ * @param <V> Type of values
+ */
+public interface KeyValueIterator<K, V> extends Iterator<KeyValue<K, V>>, Closeable {
 
     @Override
-    public void close();
+    void close();
 }

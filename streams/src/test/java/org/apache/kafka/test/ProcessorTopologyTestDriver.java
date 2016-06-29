@@ -24,18 +24,23 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.Serializer;
-import org.apache.kafka.streams.StreamingConfig;
-import org.apache.kafka.streams.StreamingMetrics;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.StreamsMetrics;
 import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.TopologyBuilder;
+import org.apache.kafka.streams.processor.internals.ProcessorContextImpl;
+import org.apache.kafka.streams.processor.internals.ProcessorStateManager;
 import org.apache.kafka.streams.processor.internals.ProcessorTopology;
 import org.apache.kafka.streams.processor.internals.StreamTask;
 import org.apache.kafka.streams.state.KeyValueStore;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -51,7 +56,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * can use and test code you already have that uses a builder to create topologies. Best of all, the class works without a real
  * Kafka broker, so the tests execute very quickly with very little overhead.
  * <p>
- * Using the ProcessorTopologyTestDriver in tests is easy: simply instantiate the driver with a {@link StreamingConfig} and a
+ * Using the ProcessorTopologyTestDriver in tests is easy: simply instantiate the driver with a {@link StreamsConfig} and a
  * TopologyBuilder, use the driver to supply an input message to the topology, and then use the driver to read and verify any
  * messages output by the topology.
  * <p>
@@ -59,56 +64,56 @@ import java.util.concurrent.atomic.AtomicLong;
  * and {@link org.apache.kafka.clients.producer.Producer}s that read and write raw {@code byte[]} messages. You can either deal
  * with messages that have {@code byte[]} keys and values, or you can supply the {@link Serializer}s and {@link Deserializer}s
  * that the driver can use to convert the keys and values into objects.
- * 
+ *
  * <h2>Driver setup</h2>
  * <p>
- * In order to create a ProcessorTopologyTestDriver instance, you need a TopologyBuilder and a {@link StreamingConfig}. The
+ * In order to create a ProcessorTopologyTestDriver instance, you need a TopologyBuilder and a {@link StreamsConfig}. The
  * configuration needs to be representative of what you'd supply to the real topology, so that means including several key
  * properties. For example, the following code fragment creates a configuration that specifies a local Kafka broker list
  * (which is needed but not used), a timestamp extractor, and default serializers and deserializers for string keys and values:
- * 
+ *
  * <pre>
  * StringSerializer strSerializer = new StringSerializer();
  * StringDeserializer strDeserializer = new StringDeserializer();
  * Properties props = new Properties();
- * props.setProperty(StreamingConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9091");
- * props.setProperty(StreamingConfig.TIMESTAMP_EXTRACTOR_CLASS_CONFIG, CustomTimestampExtractor.class.getName());
- * props.setProperty(StreamingConfig.KEY_SERIALIZER_CLASS_CONFIG, strSerializer.getClass().getName());
- * props.setProperty(StreamingConfig.KEY_DESERIALIZER_CLASS_CONFIG, strDeserializer.getClass().getName());
- * props.setProperty(StreamingConfig.VALUE_SERIALIZER_CLASS_CONFIG, strSerializer.getClass().getName());
- * props.setProperty(StreamingConfig.VALUE_DESERIALIZER_CLASS_CONFIG, strDeserializer.getClass().getName());
- * StreamingConfig config = new StreamingConfig(props);
+ * props.setProperty(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9091");
+ * props.setProperty(StreamsConfig.TIMESTAMP_EXTRACTOR_CLASS_CONFIG, CustomTimestampExtractor.class.getName());
+ * props.setProperty(StreamsConfig.KEY_SERIALIZER_CLASS_CONFIG, strSerializer.getClass().getName());
+ * props.setProperty(StreamsConfig.KEY_DESERIALIZER_CLASS_CONFIG, strDeserializer.getClass().getName());
+ * props.setProperty(StreamsConfig.VALUE_SERIALIZER_CLASS_CONFIG, strSerializer.getClass().getName());
+ * props.setProperty(StreamsConfig.VALUE_DESERIALIZER_CLASS_CONFIG, strDeserializer.getClass().getName());
+ * StreamsConfig config = new StreamsConfig(props);
  * TopologyBuilder builder = ...
  * ProcessorTopologyTestDriver driver = new ProcessorTopologyTestDriver(config, builder);
  * </pre>
- * 
+ *
  * <h2>Processing messages</h2>
  * <p>
  * Your test can supply new input records on any of the topics that the topology's sources consume. Here's an example of an
  * input message on the topic named {@code input-topic}:
- * 
+ *
  * <pre>
  * driver.process("input-topic", "key1", "value1", strSerializer, strSerializer);
  * </pre>
- * 
+ *
  * Immediately, the driver will pass the input message through to the appropriate source that consumes the named topic,
  * and will invoke the processor(s) downstream of the source. If your topology's processors forward messages to sinks,
  * your test can then consume these output messages to verify they match the expected outcome. For example, if our topology
  * should have generated 2 messages on {@code output-topic-1} and 1 message on {@code output-topic-2}, then our test can
  * obtain these messages using the {@link #readOutput(String, Deserializer, Deserializer)} method:
- * 
+ *
  * <pre>
  * ProducerRecord<String, String> record1 = driver.readOutput("output-topic-1", strDeserializer, strDeserializer);
  * ProducerRecord<String, String> record2 = driver.readOutput("output-topic-1", strDeserializer, strDeserializer);
  * ProducerRecord<String, String> record3 = driver.readOutput("output-topic-2", strDeserializer, strDeserializer);
  * </pre>
- * 
+ *
  * Again, our example topology generates messages with string keys and values, so we supply our string deserializer instance
  * for use on both the keys and values. Your test logic can then verify whether these output records are correct.
  * <p>
  * Finally, when completed, make sure your tests {@link #close()} the driver to release all resources and
  * {@link org.apache.kafka.streams.processor.Processor}s.
- * 
+ *
  * <h2>Processor state</h2>
  * <p>
  * Some processors use Kafka {@link StateStore state storage}, so this driver class provides the {@link #getStateStore(String)}
@@ -122,7 +127,9 @@ public class ProcessorTopologyTestDriver {
 
     private final Serializer<byte[]> bytesSerializer = new ByteArraySerializer();
 
-    private final int id;
+    private final String applicationId = "test-driver-application";
+
+    private final TaskId id;
     private final ProcessorTopology topology;
     private final StreamTask task;
     private final MockConsumer<byte[], byte[]> consumer;
@@ -134,17 +141,22 @@ public class ProcessorTopologyTestDriver {
 
     /**
      * Create a new test driver instance.
-     * @param config the streaming configuration for the topology
+     * @param config the stream configuration for the topology
      * @param builder the topology builder that will be used to create the topology instance
      * @param storeNames the optional names of the state stores that are used by the topology
      */
-    public ProcessorTopologyTestDriver(StreamingConfig config, TopologyBuilder builder, String... storeNames) {
-        id = 0;
-        topology = builder.build();
+    public ProcessorTopologyTestDriver(StreamsConfig config, TopologyBuilder builder, String... storeNames) {
+        id = new TaskId(0, 0);
+        topology = builder.build("X", null);
 
         // Set up the consumer and producer ...
         consumer = new MockConsumer<>(OffsetResetStrategy.EARLIEST);
-        producer = new MockProducer<>(true, bytesSerializer, bytesSerializer);
+        producer = new MockProducer<byte[], byte[]>(true, bytesSerializer, bytesSerializer) {
+            @Override
+            public List<PartitionInfo> partitionsFor(String topic) {
+                return Collections.emptyList();
+            }
+        };
         restoreStateConsumer = createRestoreConsumer(id, storeNames);
 
         // Set up all of the topic+partition information and subscribe the consumer to each ...
@@ -156,13 +168,14 @@ public class ProcessorTopologyTestDriver {
         }
 
         task = new StreamTask(id,
+            applicationId,
+            partitionsByTopic.values(),
+            topology,
             consumer,
             producer,
             restoreStateConsumer,
-            partitionsByTopic.values(),
-            topology,
             config,
-            new StreamingMetrics() {
+            new StreamsMetrics() {
                 @Override
                 public Sensor addLatencySensor(String scopeName, String entityName, String operationName, String... tags) {
                     return null;
@@ -177,7 +190,7 @@ public class ProcessorTopologyTestDriver {
 
     /**
      * Send an input message with the given key and value on the specified topic to the topology, and then commit the messages.
-     * 
+     *
      * @param topicName the name of the topic on which the message is to be sent
      * @param key the raw message key
      * @param value the raw message value
@@ -189,7 +202,7 @@ public class ProcessorTopologyTestDriver {
         }
         // Add the record ...
         long offset = offsetsByTopicPartition.get(tp).incrementAndGet();
-        task.addRecords(tp, records(new ConsumerRecord<byte[], byte[]>(tp.topic(), tp.partition(), offset, key, value)));
+        task.addRecords(tp, records(new ConsumerRecord<byte[], byte[]>(tp.topic(), tp.partition(), offset, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, key, value)));
         producer.clear();
         // Process the record ...
         task.process();
@@ -207,7 +220,7 @@ public class ProcessorTopologyTestDriver {
 
     /**
      * Send an input message with the given key and value on the specified topic to the topology.
-     * 
+     *
      * @param topicName the name of the topic on which the message is to be sent
      * @param key the raw message key
      * @param value the raw message value
@@ -221,7 +234,7 @@ public class ProcessorTopologyTestDriver {
     /**
      * Read the next record from the given topic. These records were output by the topology during the previous calls to
      * {@link #process(String, byte[], byte[])}.
-     * 
+     *
      * @param topic the name of the topic
      * @return the next record on that topic, or null if there is no record available
      */
@@ -234,7 +247,7 @@ public class ProcessorTopologyTestDriver {
     /**
      * Read the next record from the given topic. These records were output by the topology during the previous calls to
      * {@link #process(String, byte[], byte[])}.
-     * 
+     *
      * @param topic the name of the topic
      * @param keyDeserializer the deserializer for the key type
      * @param valueDeserializer the deserializer for the value type
@@ -254,29 +267,29 @@ public class ProcessorTopologyTestDriver {
 
     /**
      * Get the {@link StateStore} with the given name. The name should have been supplied via
-     * {@link #ProcessorTopologyTestDriver(StreamingConfig, TopologyBuilder, String...) this object's constructor}, and is
+     * {@link #ProcessorTopologyTestDriver(StreamsConfig, TopologyBuilder, String...) this object's constructor}, and is
      * presumed to be used by a Processor within the topology.
      * <p>
      * This is often useful in test cases to pre-populate the store before the test case instructs the topology to
      * {@link #process(String, byte[], byte[]) process an input message}, and/or to check the store afterward.
-     * 
+     *
      * @param name the name of the store
      * @return the state store, or null if no store has been registered with the given name
      * @see #getKeyValueStore(String)
      */
     public StateStore getStateStore(String name) {
-        return task.context().getStateStore(name);
+        return ((ProcessorContextImpl) task.context()).getStateMgr().getStore(name);
     }
 
     /**
      * Get the {@link KeyValueStore} with the given name. The name should have been supplied via
-     * {@link #ProcessorTopologyTestDriver(StreamingConfig, TopologyBuilder, String...) this object's constructor}, and is
+     * {@link #ProcessorTopologyTestDriver(StreamsConfig, TopologyBuilder, String...) this object's constructor}, and is
      * presumed to be used by a Processor within the topology.
      * <p>
      * This is often useful in test cases to pre-populate the store before the test case instructs the topology to
      * {@link #process(String, byte[], byte[]) process an input message}, and/or to check the store afterward.
      * <p>
-     * 
+     *
      * @param name the name of the store
      * @return the key value store, or null if no {@link KeyValueStore} has been registered with the given name
      * @see #getStateStore(String)
@@ -297,20 +310,20 @@ public class ProcessorTopologyTestDriver {
     /**
      * Utility method that creates the {@link MockConsumer} used for restoring state, which should not be done by this
      * driver object unless this method is overwritten with a functional consumer.
-     * 
+     *
      * @param id the ID of the stream task
      * @param storeNames the names of the stores that this
      * @return the mock consumer; never null
      */
-    protected MockConsumer<byte[], byte[]> createRestoreConsumer(int id, String... storeNames) {
+    protected MockConsumer<byte[], byte[]> createRestoreConsumer(TaskId id, String... storeNames) {
         MockConsumer<byte[], byte[]> consumer = new MockConsumer<byte[], byte[]>(OffsetResetStrategy.LATEST) {
             @Override
-            public synchronized void seekToEnd(TopicPartition... partitions) {
+            public synchronized void seekToEnd(Collection<TopicPartition> partitions) {
                 // do nothing ...
             }
 
             @Override
-            public synchronized void seekToBeginning(TopicPartition... partitions) {
+            public synchronized void seekToBeginning(Collection<TopicPartition> partitions) {
                 // do nothing ...
             }
 
@@ -322,14 +335,14 @@ public class ProcessorTopologyTestDriver {
         };
         // For each store name ...
         for (String storeName : storeNames) {
-            String topicName = storeName;
+            String topicName = ProcessorStateManager.storeChangelogTopic(applicationId, storeName);
             // Set up the restore-state topic ...
             // consumer.subscribe(new TopicPartition(topicName, 1));
             // Set up the partition that matches the ID (which is what ProcessorStateManager expects) ...
             List<PartitionInfo> partitionInfos = new ArrayList<>();
-            partitionInfos.add(new PartitionInfo(topicName, id, null, null, null));
+            partitionInfos.add(new PartitionInfo(topicName , id.partition, null, null, null));
             consumer.updatePartitions(topicName, partitionInfos);
-            consumer.updateEndOffsets(Collections.singletonMap(new TopicPartition(topicName, id), 0L));
+            consumer.updateEndOffsets(Collections.singletonMap(new TopicPartition(topicName, id.partition), 0L));
         }
         return consumer;
     }

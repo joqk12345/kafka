@@ -21,9 +21,6 @@ import javax.security.auth.login.AppConfigurationEntry;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.io.IOException;
-import java.io.File;
-import java.net.URI;
-import java.security.URIParameter;
 
 import org.apache.kafka.common.KafkaException;
 import org.slf4j.Logger;
@@ -61,7 +58,7 @@ public class JaasUtils {
         return null;
     }
 
-    public static String defaultRealm()
+    public static String defaultKerberosRealm()
         throws ClassNotFoundException, NoSuchMethodException,
                IllegalArgumentException, IllegalAccessException,
                InvocationTargetException {
@@ -85,29 +82,22 @@ public class JaasUtils {
         return (String) getDefaultRealmMethod.invoke(kerbConf, new Object[0]);
     }
 
-    public static boolean isZkSecurityEnabled(String loginConfigFile) {
+    public static boolean isZkSecurityEnabled() {
         boolean isSecurityEnabled = false;
-        boolean zkSaslEnabled = Boolean.getBoolean(System.getProperty(ZK_SASL_CLIENT, "true"));
+        boolean zkSaslEnabled = Boolean.parseBoolean(System.getProperty(ZK_SASL_CLIENT, "true"));
         String zkLoginContextName = System.getProperty(ZK_LOGIN_CONTEXT_NAME_KEY, "Client");
 
-        if (loginConfigFile != null && loginConfigFile.length() > 0) {
-            File configFile = new File(loginConfigFile);
-            if (!configFile.canRead()) {
-                throw new KafkaException("File " + loginConfigFile + "cannot be read.");
-            }
-            try {
-                URI configUri = configFile.toURI();
-                Configuration loginConf = Configuration.getInstance("JavaLoginConfig", new URIParameter(configUri));
-                isSecurityEnabled = loginConf.getAppConfigurationEntry(zkLoginContextName) != null;
-            } catch (Exception e) {
-                throw new KafkaException(e);
-            }
-            if (isSecurityEnabled && !zkSaslEnabled) {
-                LOG.error("JAAS file is present, but system property " + 
-                            ZK_SASL_CLIENT + " is set to false, which disables " +
-                            "SASL in the ZooKeeper client");
-                throw new KafkaException("Exception while determining if ZooKeeper is secure");
-            }
+        try {
+            Configuration loginConf = Configuration.getConfiguration();
+            isSecurityEnabled = loginConf.getAppConfigurationEntry(zkLoginContextName) != null;
+        } catch (Exception e) {
+            throw new KafkaException("Exception while loading Zookeeper JAAS login context '" + zkLoginContextName + "'", e);
+        }
+        if (isSecurityEnabled && !zkSaslEnabled) {
+            LOG.error("JAAS configuration is present, but system property " +
+                        ZK_SASL_CLIENT + " is set to false, which disables " +
+                        "SASL in the ZooKeeper client");
+            throw new KafkaException("Exception while determining if ZooKeeper is secure");
         }
 
         return isSecurityEnabled;

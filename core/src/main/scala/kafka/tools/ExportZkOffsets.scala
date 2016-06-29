@@ -25,7 +25,7 @@ import org.apache.kafka.common.security.JaasUtils
 
 
 /**
- *  A utility that retrieve the offset of broker partitions in ZK and
+ *  A utility that retrieves the offset of broker partitions in ZK and
  *  prints to an output file in the following format:
  *  
  *  /consumers/group1/offsets/topic1/1-0:286894308
@@ -80,7 +80,7 @@ object ExportZkOffsets extends Logging {
       zkUtils = ZkUtils(zkConnect,
                         30000,
                         30000,
-                        JaasUtils.isZkSecurityEnabled(System.getProperty(JaasUtils.JAVA_LOGIN_CONFIG_PARAM)))
+                        JaasUtils.isZkSecurityEnabled())
       
       var consumerGroups: Seq[String] = null
 

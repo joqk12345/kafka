@@ -17,24 +17,28 @@
 package kafka.security.auth
 
 import kafka.common.{BaseEnum, KafkaException}
+import org.apache.kafka.common.protocol.Errors
 
 /**
  * ResourceTypes.
  */
 
 
-sealed trait ResourceType extends BaseEnum
+sealed trait ResourceType extends BaseEnum { def errorCode: Short }
 
 case object Cluster extends ResourceType {
   val name = "Cluster"
+  val errorCode = Errors.CLUSTER_AUTHORIZATION_FAILED.code
 }
 
 case object Topic extends ResourceType {
   val name = "Topic"
+  val errorCode = Errors.TOPIC_AUTHORIZATION_FAILED.code
 }
 
 case object Group extends ResourceType {
   val name = "Group"
+  val errorCode = Errors.GROUP_AUTHORIZATION_FAILED.code
 }
 
 

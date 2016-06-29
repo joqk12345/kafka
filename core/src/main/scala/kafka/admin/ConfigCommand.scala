@@ -17,18 +17,18 @@
 
 package kafka.admin
 
-import joptsimple._
 import java.util.Properties
+
+import joptsimple._
 import kafka.admin.TopicCommand._
-import kafka.consumer.ConsumerConfig
 import kafka.log.{Defaults, LogConfig}
-import kafka.server.ConfigType
-import kafka.utils.{ZkUtils, CommandLineUtils}
-import org.I0Itec.zkclient.ZkClient
-import scala.collection._
-import scala.collection.JavaConversions._
-import org.apache.kafka.common.utils.Utils
+import kafka.server.{ClientConfigOverride, ConfigType}
+import kafka.utils.{CommandLineUtils, ZkUtils}
 import org.apache.kafka.common.security.JaasUtils
+import org.apache.kafka.common.utils.Utils
+
+import scala.collection.JavaConversions._
+import scala.collection._
 
 
 /**
@@ -48,7 +48,7 @@ object ConfigCommand {
     val zkUtils = ZkUtils(opts.options.valueOf(opts.zkConnectOpt),
                           30000,
                           30000,
-                          JaasUtils.isZkSecurityEnabled(System.getProperty(JaasUtils.JAVA_LOGIN_CONFIG_PARAM)))
+                          JaasUtils.isZkSecurityEnabled())
 
     try {
       if (opts.options.has(opts.alterOpt))
@@ -69,7 +69,7 @@ object ConfigCommand {
     val configsToBeDeleted = parseConfigsToBeDeleted(opts)
     val entityType = opts.options.valueOf(opts.entityType)
     val entityName = opts.options.valueOf(opts.entityName)
-    warnOnMaxMessagesChange(configsToBeAdded)
+    warnOnMaxMessagesChange(configsToBeAdded, opts.options.has(opts.forceOpt))
 
     // compile the final set of configs
     val configs = AdminUtils.fetchEntityConfig(zkUtils, entityType, entityName)
@@ -85,14 +85,15 @@ object ConfigCommand {
     }
   }
 
-  def warnOnMaxMessagesChange(configs: Properties): Unit = {
+  def warnOnMaxMessagesChange(configs: Properties, force: Boolean): Unit = {
     val maxMessageBytes = configs.get(LogConfig.MaxMessageBytesProp) match {
       case n: String => n.toInt
       case _ => -1
     }
     if (maxMessageBytes > Defaults.MaxMessageSize){
       error(TopicCommand.longMessageSizeWarning(maxMessageBytes))
-      TopicCommand.askToProceed
+      if (!force)
+        TopicCommand.askToProceed
     }
   }
 
@@ -107,16 +108,20 @@ object ConfigCommand {
     for (entityName <- entityNames) {
       val configs = AdminUtils.fetchEntityConfig(zkUtils, entityType, entityName)
       println("Configs for %s:%s are %s"
-                      .format(entityType, entityName, configs.map(kv => kv._1 + "=" + kv._2).mkString(",")))
+        .format(entityType, entityName, configs.map(kv => kv._1 + "=" + kv._2).mkString(",")))
     }
   }
 
   private[admin] def parseConfigsToBeAdded(opts: ConfigCommandOptions): Properties = {
     val configsToBeAdded = opts.options.valuesOf(opts.addConfig).map(_.split("""\s*=\s*"""))
     require(configsToBeAdded.forall(config => config.length == 2),
-            "Invalid entity config: all configs to be added must be in the format \"key=val\".")
+      "Invalid entity config: all configs to be added must be in the format \"key=val\".")
     val props = new Properties
     configsToBeAdded.foreach(pair => props.setProperty(pair(0).trim, pair(1).trim))
+    if (props.containsKey(LogConfig.MessageFormatVersionProp)) {
+      println(s"WARNING: The configuration ${LogConfig.MessageFormatVersionProp}=${props.getProperty(LogConfig.MessageFormatVersionProp)} is specified. " +
+        s"This configuration will be ignored if the version is newer than the inter.broker.protocol.version specified in the broker.")
+    }
     props
   }
 
@@ -150,7 +155,8 @@ object ConfigCommand {
     val nl = System.getProperty("line.separator")
     val addConfig = parser.accepts("add-config", "Key Value pairs configs to add 'k1=v1,k2=v2'. The following is a list of valid configurations: " +
             "For entity_type '" + ConfigType.Topic + "': " + nl + LogConfig.configNames.map("\t" + _).mkString(nl) + nl +
-            "For entity_type '" + ConfigType.Client + "' currently no configs are processed by the brokers")
+            "For entity_type '" + ConfigType.Client + "': " + nl + "\t" + ClientConfigOverride.ProducerOverride
+                                                            + nl + "\t" + ClientConfigOverride.ConsumerOverride)
             .withRequiredArg
             .ofType(classOf[String])
             .withValuesSeparatedBy(',')
@@ -159,6 +165,7 @@ object ConfigCommand {
             .ofType(classOf[String])
             .withValuesSeparatedBy(',')
     val helpOpt = parser.accepts("help", "Print usage information.")
+    val forceOpt = parser.accepts("force", "Suppress console prompts")
     val options = parser.parse(args : _*)
 
     val allOpts: Set[OptionSpec[_]] = Set(alterOpt, describeOpt, entityType, entityName, addConfig, deleteConfig, helpOpt)

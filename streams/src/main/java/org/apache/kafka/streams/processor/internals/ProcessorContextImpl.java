@@ -17,62 +17,67 @@
 
 package org.apache.kafka.streams.processor.internals;
 
-import org.apache.kafka.common.KafkaException;
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.serialization.Deserializer;
-import org.apache.kafka.common.serialization.Serializer;
-import org.apache.kafka.streams.StreamingConfig;
-import org.apache.kafka.streams.StreamingMetrics;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.streams.errors.TopologyBuilderException;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.StreamsMetrics;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.StateRestoreCallback;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.kafka.streams.processor.TaskId;
 
 import java.io.File;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
 
 public class ProcessorContextImpl implements ProcessorContext, RecordCollector.Supplier {
 
-    private static final Logger log = LoggerFactory.getLogger(ProcessorContextImpl.class);
+    public static final String NONEXIST_TOPIC = "__null_topic__";
 
-    private final int id;
+    private final TaskId id;
     private final StreamTask task;
-    private final StreamingMetrics metrics;
+    private final StreamsMetrics metrics;
     private final RecordCollector collector;
     private final ProcessorStateManager stateMgr;
 
-    private final Serializer<?> keySerializer;
-    private final Serializer<?> valSerializer;
-    private final Deserializer<?> keyDeserializer;
-    private final Deserializer<?> valDeserializer;
+    private final Serde<?> keySerde;
+    private final Serde<?> valSerde;
 
     private boolean initialized;
 
     @SuppressWarnings("unchecked")
-    public ProcessorContextImpl(int id,
+    public ProcessorContextImpl(TaskId id,
                                 StreamTask task,
-                                StreamingConfig config,
+                                StreamsConfig config,
                                 RecordCollector collector,
                                 ProcessorStateManager stateMgr,
-                                StreamingMetrics metrics) {
+                                StreamsMetrics metrics) {
         this.id = id;
         this.task = task;
         this.metrics = metrics;
         this.collector = collector;
         this.stateMgr = stateMgr;
 
-        this.keySerializer = config.getConfiguredInstance(StreamingConfig.KEY_SERIALIZER_CLASS_CONFIG, Serializer.class);
-        this.valSerializer = config.getConfiguredInstance(StreamingConfig.VALUE_SERIALIZER_CLASS_CONFIG, Serializer.class);
-        this.keyDeserializer = config.getConfiguredInstance(StreamingConfig.KEY_DESERIALIZER_CLASS_CONFIG, Deserializer.class);
-        this.valDeserializer = config.getConfiguredInstance(StreamingConfig.VALUE_DESERIALIZER_CLASS_CONFIG, Deserializer.class);
+        this.keySerde = config.keySerde();
+        this.valSerde = config.valueSerde();
 
         this.initialized = false;
+    }
+
+    public void initialized() {
+        this.initialized = true;
+    }
+
+    public ProcessorStateManager getStateMgr() {
+        return stateMgr;
+    }
+
+    @Override
+    public TaskId taskId() {
+        return id;
+    }
+
+    @Override
+    public String applicationId() {
+        return task.applicationId();
     }
 
     @Override
@@ -80,62 +85,14 @@ public class ProcessorContextImpl implements ProcessorContext, RecordCollector.S
         return this.collector;
     }
 
-    public void initialized() {
-        this.initialized = true;
+    @Override
+    public Serde<?> keySerde() {
+        return this.keySerde;
     }
 
     @Override
-    public boolean joinable() {
-        Set<TopicPartition> partitions = this.task.partitions();
-        Map<Integer, List<String>> partitionsById = new HashMap<>();
-        int firstId = -1;
-        for (TopicPartition partition : partitions) {
-            if (!partitionsById.containsKey(partition.partition())) {
-                partitionsById.put(partition.partition(), new ArrayList<String>());
-            }
-            partitionsById.get(partition.partition()).add(partition.topic());
-
-            if (firstId < 0)
-                firstId = partition.partition();
-        }
-
-        List<String> topics = partitionsById.get(firstId);
-        for (List<String> topicsPerPartition : partitionsById.values()) {
-            if (topics.size() != topicsPerPartition.size())
-                return false;
-
-            for (String topic : topicsPerPartition) {
-                if (!topics.contains(topic))
-                    return false;
-            }
-        }
-
-        return true;
-    }
-
-    @Override
-    public int id() {
-        return id;
-    }
-
-    @Override
-    public Serializer<?> keySerializer() {
-        return this.keySerializer;
-    }
-
-    @Override
-    public Serializer<?> valueSerializer() {
-        return this.valSerializer;
-    }
-
-    @Override
-    public Deserializer<?> keyDeserializer() {
-        return this.keyDeserializer;
-    }
-
-    @Override
-    public Deserializer<?> valueDeserializer() {
-        return this.valDeserializer;
+    public Serde<?> valueSerde() {
+        return this.valSerde;
     }
 
     @Override
@@ -144,51 +101,83 @@ public class ProcessorContextImpl implements ProcessorContext, RecordCollector.S
     }
 
     @Override
-    public StreamingMetrics metrics() {
+    public StreamsMetrics metrics() {
         return metrics;
     }
 
+    /**
+     * @throws IllegalStateException if this method is called before {@link #initialized()}
+     */
     @Override
-    public void register(StateStore store, StateRestoreCallback stateRestoreCallback) {
+    public void register(StateStore store, boolean loggingEnabled, StateRestoreCallback stateRestoreCallback) {
         if (initialized)
-            throw new KafkaException("Can only create state stores during initialization.");
+            throw new IllegalStateException("Can only create state stores during initialization.");
 
-        stateMgr.register(store, stateRestoreCallback);
+        stateMgr.register(store, loggingEnabled, stateRestoreCallback);
     }
 
+    /**
+     * @throws TopologyBuilderException if an attempt is made to access this state store from an unknown node
+     */
     @Override
     public StateStore getStateStore(String name) {
+        ProcessorNode node = task.node();
+
+        if (node == null)
+            throw new TopologyBuilderException("Accessing from an unknown node");
+
+        // TODO: restore this once we fix the ValueGetter initialization issue
+        //if (!node.stateStores.contains(name))
+        //    throw new TopologyBuilderException("Processor " + node.name() + " has no access to StateStore " + name);
+
         return stateMgr.getStore(name);
     }
 
+    /**
+     * @throws IllegalStateException if the task's record is null
+     */
     @Override
     public String topic() {
         if (task.record() == null)
-            throw new IllegalStateException("this should not happen as topic() should only be called while a record is processed");
+            throw new IllegalStateException("This should not happen as topic() should only be called while a record is processed");
 
-        return task.record().topic();
+        String topic = task.record().topic();
+
+        if (topic.equals(NONEXIST_TOPIC))
+            return null;
+        else
+            return topic;
     }
 
+    /**
+     * @throws IllegalStateException if the task's record is null
+     */
     @Override
     public int partition() {
         if (task.record() == null)
-            throw new IllegalStateException("this should not happen as partition() should only be called while a record is processed");
+            throw new IllegalStateException("This should not happen as partition() should only be called while a record is processed");
 
         return task.record().partition();
     }
 
+    /**
+     * @throws IllegalStateException if the task's record is null
+     */
     @Override
     public long offset() {
         if (this.task.record() == null)
-            throw new IllegalStateException("this should not happen as offset() should only be called while a record is processed");
+            throw new IllegalStateException("This should not happen as offset() should only be called while a record is processed");
 
         return this.task.record().offset();
     }
 
+    /**
+     * @throws IllegalStateException if the task's record is null
+     */
     @Override
     public long timestamp() {
         if (task.record() == null)
-            throw new IllegalStateException("this should not happen as timestamp() should only be called while a record is processed");
+            throw new IllegalStateException("This should not happen as timestamp() should only be called while a record is processed");
 
         return task.record().timestamp;
     }
@@ -201,6 +190,11 @@ public class ProcessorContextImpl implements ProcessorContext, RecordCollector.S
     @Override
     public <K, V> void forward(K key, V value, int childIndex) {
         task.forward(key, value, childIndex);
+    }
+
+    @Override
+    public <K, V> void forward(K key, V value, String childName) {
+        task.forward(key, value, childName);
     }
 
     @Override

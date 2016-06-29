@@ -14,9 +14,12 @@ package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.ClientResponse;
 import org.apache.kafka.common.KafkaException;
-import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.errors.DisconnectException;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
+import org.apache.kafka.common.errors.GroupCoordinatorNotAvailableException;
+import org.apache.kafka.common.errors.IllegalGenerationException;
+import org.apache.kafka.common.errors.RebalanceInProgressException;
 import org.apache.kafka.common.errors.UnknownMemberIdException;
 import org.apache.kafka.common.metrics.Measurable;
 import org.apache.kafka.common.metrics.MetricConfig;
@@ -28,25 +31,25 @@ import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.metrics.stats.Rate;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.protocol.types.SchemaException;
-import org.apache.kafka.common.requests.GroupMetadataRequest;
-import org.apache.kafka.common.requests.GroupMetadataResponse;
+import org.apache.kafka.common.requests.GroupCoordinatorRequest;
+import org.apache.kafka.common.requests.GroupCoordinatorResponse;
 import org.apache.kafka.common.requests.HeartbeatRequest;
 import org.apache.kafka.common.requests.HeartbeatResponse;
 import org.apache.kafka.common.requests.JoinGroupRequest;
+import org.apache.kafka.common.requests.JoinGroupRequest.ProtocolMetadata;
 import org.apache.kafka.common.requests.JoinGroupResponse;
+import org.apache.kafka.common.requests.LeaveGroupRequest;
+import org.apache.kafka.common.requests.LeaveGroupResponse;
 import org.apache.kafka.common.requests.OffsetCommitRequest;
 import org.apache.kafka.common.requests.SyncGroupRequest;
 import org.apache.kafka.common.requests.SyncGroupResponse;
 import org.apache.kafka.common.utils.Time;
-import org.apache.kafka.common.utils.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Closeable;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -71,11 +74,11 @@ import java.util.concurrent.TimeUnit;
  *
  * To leverage this protocol, an implementation must define the format of metadata provided by each
  * member for group registration in {@link #metadata()} and the format of the state assignment provided
- * by the leader in {@link #doSync(String, String, Map)} and becomes available to members in
- * {@link #onJoin(int, String, String, ByteBuffer)}.
+ * by the leader in {@link #performAssignment(String, String, Map)} and becomes available to members in
+ * {@link #onJoinComplete(int, String, String, ByteBuffer)}.
  *
  */
-public abstract class AbstractCoordinator {
+public abstract class AbstractCoordinator implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(AbstractCoordinator.class);
 
@@ -87,8 +90,8 @@ public abstract class AbstractCoordinator {
     protected final ConsumerNetworkClient client;
     protected final Time time;
     protected final long retryBackoffMs;
-    protected final long requestTimeoutMs;
 
+    private boolean needsJoinPrepare = true;
     private boolean rejoinNeeded = true;
     protected Node coordinator;
     protected String memberId;
@@ -104,9 +107,7 @@ public abstract class AbstractCoordinator {
                                int heartbeatIntervalMs,
                                Metrics metrics,
                                String metricGrpPrefix,
-                               Map<String, String> metricTags,
                                Time time,
-                               long requestTimeoutMs,
                                long retryBackoffMs) {
         this.client = client;
         this.time = time;
@@ -117,27 +118,45 @@ public abstract class AbstractCoordinator {
         this.sessionTimeoutMs = sessionTimeoutMs;
         this.heartbeat = new Heartbeat(this.sessionTimeoutMs, heartbeatIntervalMs, time.milliseconds());
         this.heartbeatTask = new HeartbeatTask();
-        this.sensors = new GroupCoordinatorMetrics(metrics, metricGrpPrefix, metricTags);
-        this.requestTimeoutMs = requestTimeoutMs;
+        this.sensors = new GroupCoordinatorMetrics(metrics, metricGrpPrefix);
         this.retryBackoffMs = retryBackoffMs;
     }
 
     /**
-     * Unique identifier for the class of protocols implements (e.g. "consumer" or "copycat").
-     * @return Non-null protocol type namej
+     * Unique identifier for the class of protocols implements (e.g. "consumer" or "connect").
+     * @return Non-null protocol type name
      */
     protected abstract String protocolType();
 
     /**
      * Get the current list of protocols and their associated metadata supported
-     * by the local member. The order of the protocols in the map indicates the preference
+     * by the local member. The order of the protocols in the list indicates the preference
      * of the protocol (the first entry is the most preferred). The coordinator takes this
      * preference into account when selecting the generation protocol (generally more preferred
      * protocols will be selected as long as all members support them and there is no disagreement
      * on the preference).
      * @return Non-empty map of supported protocols and metadata
      */
-    protected abstract LinkedHashMap<String, ByteBuffer> metadata();
+    protected abstract List<ProtocolMetadata> metadata();
+
+    /**
+     * Invoked prior to each group join or rejoin. This is typically used to perform any
+     * cleanup from the previous generation (such as committing offsets for the consumer)
+     * @param generation The previous generation or -1 if there was none
+     * @param memberId The identifier of this member in the previous group or "" if there was none
+     */
+    protected abstract void onJoinPrepare(int generation, String memberId);
+
+    /**
+     * Perform assignment for the group. This is used by the leader to push state to all the members
+     * of the group (e.g. to push partition assignments in the case of the new consumer)
+     * @param leaderId The id of the leader (which is this member)
+     * @param allMemberMetadata Metadata from all members of the group
+     * @return A map from each member to their state assignment
+     */
+    protected abstract Map<String, ByteBuffer> performAssignment(String leaderId,
+                                                                 String protocol,
+                                                                 Map<String, ByteBuffer> allMemberMetadata);
 
     /**
      * Invoked when a group member has successfully joined a group.
@@ -146,40 +165,31 @@ public abstract class AbstractCoordinator {
      * @param protocol The protocol selected by the coordinator
      * @param memberAssignment The assignment propagated from the group leader
      */
-    protected abstract void onJoin(int generation,
-                                   String memberId,
-                                   String protocol,
-                                   ByteBuffer memberAssignment);
+    protected abstract void onJoinComplete(int generation,
+                                           String memberId,
+                                           String protocol,
+                                           ByteBuffer memberAssignment);
 
     /**
-     * Perform synchronization for the group. This is used by the leader to push state to all the members
-     * of the group (e.g. to push partition assignments in the case of the new consumer)
-     * @param leaderId The id of the leader (which is this member)
-     * @param allMemberMetadata Metadata from all members of the group
-     * @return A map from each member to their state assignment
+     * Block until the coordinator for this group is known and is ready to receive requests.
      */
-    protected abstract Map<String, ByteBuffer> doSync(String leaderId,
-                                                      String protocol,
-                                                      Map<String, ByteBuffer> allMemberMetadata);
-
-    /**
-     * Invoked when the group is left (whether because of shutdown, metadata change, stale generation, etc.)
-     * @param generation The generation that was left
-     * @param memberId The identifier of the local member in the group
-     */
-    protected abstract void onLeave(int generation, String memberId);
-
-
-    /**
-     * Block until the coordinator for this group is known.
-     */
-    public void ensureCoordinatorKnown() {
+    public void ensureCoordinatorReady() {
         while (coordinatorUnknown()) {
-            RequestFuture<Void> future = sendGroupMetadataRequest();
-            client.poll(future, requestTimeoutMs);
+            RequestFuture<Void> future = sendGroupCoordinatorRequest();
+            client.poll(future);
 
-            if (future.failed())
-                client.awaitMetadataUpdate();
+            if (future.failed()) {
+                if (future.isRetriable())
+                    client.awaitMetadataUpdate();
+                else
+                    throw future.exception();
+            } else if (coordinator != null && client.connectionFailed(coordinator)) {
+                // we found the coordinator, but the connection has failed, so mark
+                // it dead and backoff before retrying discovery
+                coordinatorDead();
+                time.sleep(retryBackoffMs);
+            }
+
         }
     }
 
@@ -192,26 +202,19 @@ public abstract class AbstractCoordinator {
     }
 
     /**
-     * Reset the generation/memberId tracked by this member
-     */
-    public void resetGeneration() {
-        this.generation = OffsetCommitRequest.DEFAULT_GENERATION_ID;
-        this.memberId = JoinGroupRequest.UNKNOWN_MEMBER_ID;
-        rejoinNeeded = true;
-    }
-
-    /**
      * Ensure that the group is active (i.e. joined and synced)
      */
     public void ensureActiveGroup() {
         if (!needRejoin())
             return;
 
-        // onLeave only invoked if we have a valid current generation
-        onLeave(generation, memberId);
+        if (needsJoinPrepare) {
+            onJoinPrepare(generation, memberId);
+            needsJoinPrepare = false;
+        }
 
         while (needRejoin()) {
-            ensureCoordinatorKnown();
+            ensureCoordinatorReady();
 
             // ensure that there are no pending requests to the coordinator. This is important
             // in particular to avoid resending a pending JoinGroup request.
@@ -221,29 +224,49 @@ public abstract class AbstractCoordinator {
             }
 
             RequestFuture<ByteBuffer> future = sendJoinGroupRequest();
+            future.addListener(new RequestFutureListener<ByteBuffer>() {
+                @Override
+                public void onSuccess(ByteBuffer value) {
+                    // handle join completion in the callback so that the callback will be invoked
+                    // even if the consumer is woken up before finishing the rebalance
+                    onJoinComplete(generation, memberId, protocol, value);
+                    needsJoinPrepare = true;
+                    heartbeatTask.reset();
+                }
+
+                @Override
+                public void onFailure(RuntimeException e) {
+                    // we handle failures below after the request finishes. if the join completes
+                    // after having been woken up, the exception is ignored and we will rejoin
+                }
+            });
             client.poll(future);
 
-            if (future.succeeded()) {
-                onJoin(generation, memberId, protocol, future.value());
-                heartbeatTask.reset();
-            } else {
-                if (future.exception() instanceof UnknownMemberIdException)
+            if (future.failed()) {
+                RuntimeException exception = future.exception();
+                if (exception instanceof UnknownMemberIdException ||
+                        exception instanceof RebalanceInProgressException ||
+                        exception instanceof IllegalGenerationException)
                     continue;
                 else if (!future.isRetriable())
-                    throw future.exception();
-                Utils.sleep(retryBackoffMs);
+                    throw exception;
+                time.sleep(retryBackoffMs);
             }
         }
     }
 
     private class HeartbeatTask implements DelayedTask {
 
+        private boolean requestInFlight = false;
+
         public void reset() {
             // start or restart the heartbeat task to be executed at the next chance
             long now = time.milliseconds();
             heartbeat.resetSessionTimeout(now);
             client.unschedule(this);
-            client.schedule(this, now);
+
+            if (!requestInFlight)
+                client.schedule(this, now);
         }
 
         @Override
@@ -266,10 +289,13 @@ public abstract class AbstractCoordinator {
                 client.schedule(this, now + heartbeat.timeToNextHeartbeat(now));
             } else {
                 heartbeat.sentHeartbeat(now);
+                requestInFlight = true;
+
                 RequestFuture<Void> future = sendHeartbeatRequest();
                 future.addListener(new RequestFutureListener<Void>() {
                     @Override
                     public void onSuccess(Void value) {
+                        requestInFlight = false;
                         long now = time.milliseconds();
                         heartbeat.receiveHeartbeat(now);
                         long nextHeartbeatTime = now + heartbeat.timeToNextHeartbeat(now);
@@ -278,6 +304,7 @@ public abstract class AbstractCoordinator {
 
                     @Override
                     public void onFailure(RuntimeException e) {
+                        requestInFlight = false;
                         client.schedule(HeartbeatTask.this, time.milliseconds() + retryBackoffMs);
                     }
                 });
@@ -286,31 +313,25 @@ public abstract class AbstractCoordinator {
     }
 
     /**
-     * Send a request to get a new partition assignment. This is a non-blocking call which sends
-     * a JoinGroup request to the coordinator (if it is available). The returned future must
-     * be polled to see if the request completed successfully.
-     * @return A request future whose completion indicates the result of the JoinGroup request.
+     * Join the group and return the assignment for the next generation. This function handles both
+     * JoinGroup and SyncGroup, delegating to {@link #performAssignment(String, String, Map)} if
+     * elected leader by the coordinator.
+     * @return A request future which wraps the assignment returned from the group leader
      */
     private RequestFuture<ByteBuffer> sendJoinGroupRequest() {
         if (coordinatorUnknown())
             return RequestFuture.coordinatorNotAvailable();
 
         // send a join group request to the coordinator
-        log.debug("(Re-)joining group {}", groupId);
-
-        List<JoinGroupRequest.GroupProtocol> protocols = new ArrayList<>();
-        for (Map.Entry<String, ByteBuffer> metadataEntry : metadata().entrySet())
-            protocols.add(new JoinGroupRequest.GroupProtocol(metadataEntry.getKey(), metadataEntry.getValue()));
-
+        log.info("(Re-)joining group {}", groupId);
         JoinGroupRequest request = new JoinGroupRequest(
                 groupId,
                 this.sessionTimeoutMs,
                 this.memberId,
                 protocolType(),
-                protocols);
+                metadata());
 
-        // create the request for the coordinator
-        log.debug("Issuing request ({}: {}) to coordinator {}", ApiKeys.JOIN_GROUP, request, this.coordinator.id());
+        log.debug("Sending JoinGroup ({}) to coordinator {}", request, this.coordinator);
         return client.send(coordinator, ApiKeys.JOIN_GROUP, request)
                 .compose(new JoinGroupResponseHandler());
     }
@@ -325,63 +346,69 @@ public abstract class AbstractCoordinator {
 
         @Override
         public void handle(JoinGroupResponse joinResponse, RequestFuture<ByteBuffer> future) {
-            // process the response
-            short errorCode = joinResponse.errorCode();
-            if (errorCode == Errors.NONE.code()) {
-                log.debug("Joined group: {}", joinResponse.toStruct());
+            Errors error = Errors.forCode(joinResponse.errorCode());
+            if (error == Errors.NONE) {
+                log.debug("Received successful join group response for group {}: {}", groupId, joinResponse.toStruct());
                 AbstractCoordinator.this.memberId = joinResponse.memberId();
                 AbstractCoordinator.this.generation = joinResponse.generationId();
                 AbstractCoordinator.this.rejoinNeeded = false;
                 AbstractCoordinator.this.protocol = joinResponse.groupProtocol();
                 sensors.joinLatency.record(response.requestLatencyMs());
-                performSync(joinResponse).chain(future);
-            } else if (errorCode == Errors.UNKNOWN_MEMBER_ID.code()) {
+                if (joinResponse.isLeader()) {
+                    onJoinLeader(joinResponse).chain(future);
+                } else {
+                    onJoinFollower().chain(future);
+                }
+            } else if (error == Errors.GROUP_LOAD_IN_PROGRESS) {
+                log.debug("Attempt to join group {} rejected since coordinator {} is loading the group.", groupId,
+                        coordinator);
+                // backoff and retry
+                future.raise(error);
+            } else if (error == Errors.UNKNOWN_MEMBER_ID) {
                 // reset the member id and retry immediately
                 AbstractCoordinator.this.memberId = JoinGroupRequest.UNKNOWN_MEMBER_ID;
-                log.info("Attempt to join group {} failed due to unknown member id, resetting and retrying.",
-                        groupId);
+                log.debug("Attempt to join group {} failed due to unknown member id.", groupId);
                 future.raise(Errors.UNKNOWN_MEMBER_ID);
-            } else if (errorCode == Errors.GROUP_COORDINATOR_NOT_AVAILABLE.code()
-                    || errorCode == Errors.NOT_COORDINATOR_FOR_GROUP.code()) {
+            } else if (error == Errors.GROUP_COORDINATOR_NOT_AVAILABLE
+                    || error == Errors.NOT_COORDINATOR_FOR_GROUP) {
                 // re-discover the coordinator and retry with backoff
                 coordinatorDead();
-                log.info("Attempt to join group {} failed due to obsolete coordinator information, retrying.",
-                        groupId);
-                future.raise(Errors.forCode(errorCode));
-            } else if (errorCode == Errors.INCONSISTENT_GROUP_PROTOCOL.code()
-                    || errorCode == Errors.INVALID_SESSION_TIMEOUT.code()) {
-                // log the error and re-throw the exception
-                Errors error = Errors.forCode(errorCode);
-                log.error("Attempt to join group {} failed due to: {}",
-                        groupId, error.exception().getMessage());
+                log.debug("Attempt to join group {} failed due to obsolete coordinator information: {}", groupId, error.message());
                 future.raise(error);
+            } else if (error == Errors.INCONSISTENT_GROUP_PROTOCOL
+                    || error == Errors.INVALID_SESSION_TIMEOUT
+                    || error == Errors.INVALID_GROUP_ID) {
+                // log the error and re-throw the exception
+                log.error("Attempt to join group {} failed due to fatal error: {}", groupId, error.message());
+                future.raise(error);
+            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
+                future.raise(new GroupAuthorizationException(groupId));
             } else {
                 // unexpected error, throw the exception
-                future.raise(new KafkaException("Unexpected error in join group response: "
-                        + Errors.forCode(joinResponse.errorCode()).exception().getMessage()));
+                future.raise(new KafkaException("Unexpected error in join group response: " + error.message()));
             }
         }
     }
 
-    private RequestFuture<ByteBuffer> performSync(JoinGroupResponse joinResponse) {
-        if (joinResponse.isLeader()) {
-            try {
-                // perform the leader synchronization and send back the assignment for the group
-                Map<String, ByteBuffer> groupAssignment = doSync(joinResponse.leaderId(), joinResponse.groupProtocol(),
-                        joinResponse.members());
+    private RequestFuture<ByteBuffer> onJoinFollower() {
+        // send follower's sync group with an empty assignment
+        SyncGroupRequest request = new SyncGroupRequest(groupId, generation,
+                memberId, Collections.<String, ByteBuffer>emptyMap());
+        log.debug("Sending follower SyncGroup for group {} to coordinator {}: {}", groupId, this.coordinator, request);
+        return sendSyncGroupRequest(request);
+    }
 
-                SyncGroupRequest request = new SyncGroupRequest(groupId, generation, memberId, groupAssignment);
-                log.debug("Issuing leader SyncGroup ({}: {}) to coordinator {}", ApiKeys.SYNC_GROUP, request, this.coordinator.id());
-                return sendSyncGroupRequest(request);
-            } catch (RuntimeException e) {
-                return RequestFuture.failure(e);
-            }
-        } else {
-            // send follower's sync group with an empty assignment
-            SyncGroupRequest request = new SyncGroupRequest(groupId, generation,
-                    memberId, Collections.<String, ByteBuffer>emptyMap());
-            log.debug("Issuing follower SyncGroup ({}: {}) to coordinator {}", ApiKeys.SYNC_GROUP, request, this.coordinator.id());
+    private RequestFuture<ByteBuffer> onJoinLeader(JoinGroupResponse joinResponse) {
+        try {
+            // perform the leader synchronization and send back the assignment for the group
+            Map<String, ByteBuffer> groupAssignment = performAssignment(joinResponse.leaderId(), joinResponse.groupProtocol(),
+                    joinResponse.members());
+
+            SyncGroupRequest request = new SyncGroupRequest(groupId, generation, memberId, groupAssignment);
+            log.debug("Sending leader SyncGroup for group {} to coordinator {}: {}", groupId, this.coordinator, request);
             return sendSyncGroupRequest(request);
+        } catch (RuntimeException e) {
+            return RequestFuture.failure(e);
         }
     }
 
@@ -389,10 +416,10 @@ public abstract class AbstractCoordinator {
         if (coordinatorUnknown())
             return RequestFuture.coordinatorNotAvailable();
         return client.send(coordinator, ApiKeys.SYNC_GROUP, request)
-                .compose(new SyncGroupRequestHandler());
+                .compose(new SyncGroupResponseHandler());
     }
 
-    private class SyncGroupRequestHandler extends CoordinatorResponseHandler<SyncGroupResponse, ByteBuffer> {
+    private class SyncGroupResponseHandler extends CoordinatorResponseHandler<SyncGroupResponse, ByteBuffer> {
 
         @Override
         public SyncGroupResponse parse(ClientResponse response) {
@@ -402,17 +429,31 @@ public abstract class AbstractCoordinator {
         @Override
         public void handle(SyncGroupResponse syncResponse,
                            RequestFuture<ByteBuffer> future) {
-            short errorCode = syncResponse.errorCode();
-            if (errorCode == Errors.NONE.code()) {
-                try {
-                    future.complete(syncResponse.memberAssignment());
-                    sensors.syncLatency.record(response.requestLatencyMs());
-                } catch (SchemaException e) {
-                    future.raise(e);
-                }
+            Errors error = Errors.forCode(syncResponse.errorCode());
+            if (error == Errors.NONE) {
+                log.info("Successfully joined group {} with generation {}", groupId, generation);
+                sensors.syncLatency.record(response.requestLatencyMs());
+                future.complete(syncResponse.memberAssignment());
             } else {
                 AbstractCoordinator.this.rejoinNeeded = true;
-                future.raise(Errors.forCode(errorCode));
+                if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
+                    future.raise(new GroupAuthorizationException(groupId));
+                } else if (error == Errors.REBALANCE_IN_PROGRESS) {
+                    log.debug("SyncGroup for group {} failed due to coordinator rebalance", groupId);
+                    future.raise(error);
+                } else if (error == Errors.UNKNOWN_MEMBER_ID
+                        || error == Errors.ILLEGAL_GENERATION) {
+                    log.debug("SyncGroup for group {} failed due to {}", groupId, error);
+                    AbstractCoordinator.this.memberId = JoinGroupRequest.UNKNOWN_MEMBER_ID;
+                    future.raise(error);
+                } else if (error == Errors.GROUP_COORDINATOR_NOT_AVAILABLE
+                        || error == Errors.NOT_COORDINATOR_FOR_GROUP) {
+                    log.debug("SyncGroup for group {} failed due to {}", groupId, error);
+                    coordinatorDead();
+                    future.raise(error);
+                } else {
+                    future.raise(new KafkaException("Unexpected error from SyncGroup: " + error.message()));
+                }
             }
         }
     }
@@ -422,7 +463,7 @@ public abstract class AbstractCoordinator {
      * one of the brokers. The returned future should be polled to get the result of the request.
      * @return A request future which indicates the completion of the metadata request
      */
-    private RequestFuture<Void> sendGroupMetadataRequest() {
+    private RequestFuture<Void> sendGroupCoordinatorRequest() {
         // initiate the group metadata request
         // find a node to ask about the coordinator
         Node node = this.client.leastLoadedNode();
@@ -432,9 +473,9 @@ public abstract class AbstractCoordinator {
             return RequestFuture.noBrokersAvailable();
         } else {
             // create a group  metadata request
-            log.debug("Issuing group metadata request to broker {}", node.id());
-            GroupMetadataRequest metadataRequest = new GroupMetadataRequest(this.groupId);
-            return client.send(node, ApiKeys.GROUP_METADATA, metadataRequest)
+            log.debug("Sending coordinator request for group {} to broker {}", groupId, node);
+            GroupCoordinatorRequest metadataRequest = new GroupCoordinatorRequest(this.groupId);
+            return client.send(node, ApiKeys.GROUP_COORDINATOR, metadataRequest)
                     .compose(new RequestFutureAdapter<ClientResponse, Void>() {
                         @Override
                         public void onSuccess(ClientResponse response, RequestFuture<Void> future) {
@@ -445,51 +486,123 @@ public abstract class AbstractCoordinator {
     }
 
     private void handleGroupMetadataResponse(ClientResponse resp, RequestFuture<Void> future) {
-        log.debug("Group metadata response {}", resp);
+        log.debug("Received group coordinator response {}", resp);
 
-        // parse the response to get the coordinator info if it is not disconnected,
-        // otherwise we need to request metadata update
-        if (resp.wasDisconnected()) {
-            future.raise(new DisconnectException());
-        } else if (!coordinatorUnknown()) {
+        if (!coordinatorUnknown()) {
             // We already found the coordinator, so ignore the request
             future.complete(null);
         } else {
-            GroupMetadataResponse groupMetadataResponse = new GroupMetadataResponse(resp.responseBody());
+            GroupCoordinatorResponse groupCoordinatorResponse = new GroupCoordinatorResponse(resp.responseBody());
             // use MAX_VALUE - node.id as the coordinator id to mimic separate connections
             // for the coordinator in the underlying network client layer
             // TODO: this needs to be better handled in KAFKA-1935
-            if (groupMetadataResponse.errorCode() == Errors.NONE.code()) {
-                this.coordinator = new Node(Integer.MAX_VALUE - groupMetadataResponse.node().id(),
-                        groupMetadataResponse.node().host(),
-                        groupMetadataResponse.node().port());
+            Errors error = Errors.forCode(groupCoordinatorResponse.errorCode());
+            if (error == Errors.NONE) {
+                this.coordinator = new Node(Integer.MAX_VALUE - groupCoordinatorResponse.node().id(),
+                        groupCoordinatorResponse.node().host(),
+                        groupCoordinatorResponse.node().port());
+
+                log.info("Discovered coordinator {} for group {}.", coordinator, groupId);
+
+                client.tryConnect(coordinator);
 
                 // start sending heartbeats only if we have a valid generation
                 if (generation > 0)
                     heartbeatTask.reset();
                 future.complete(null);
+            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
+                future.raise(new GroupAuthorizationException(groupId));
             } else {
-                future.raise(Errors.forCode(groupMetadataResponse.errorCode()));
+                future.raise(error);
             }
         }
     }
 
     /**
-     * Check if we know who the coordinator is.
+     * Check if we know who the coordinator is and we have an active connection
      * @return true if the coordinator is unknown
      */
     public boolean coordinatorUnknown() {
-        return this.coordinator == null;
-    }
+        if (coordinator == null)
+            return true;
 
+        if (client.connectionFailed(coordinator)) {
+            coordinatorDead();
+            return true;
+        }
+
+        return false;
+    }
 
     /**
      * Mark the current coordinator as dead.
      */
     protected void coordinatorDead() {
         if (this.coordinator != null) {
-            log.info("Marking the coordinator {} dead.", this.coordinator.id());
+            log.info("Marking the coordinator {} dead for group {}", this.coordinator, groupId);
+            client.failUnsentRequests(this.coordinator, GroupCoordinatorNotAvailableException.INSTANCE);
             this.coordinator = null;
+        }
+    }
+
+    /**
+     * Close the coordinator, waiting if needed to send LeaveGroup.
+     */
+    @Override
+    public void close() {
+        // we do not need to re-enable wakeups since we are closing already
+        client.disableWakeups();
+        maybeLeaveGroup();
+    }
+
+    /**
+     * Leave the current group and reset local generation/memberId.
+     */
+    public void maybeLeaveGroup() {
+        client.unschedule(heartbeatTask);
+        if (!coordinatorUnknown() && generation > 0) {
+            // this is a minimal effort attempt to leave the group. we do not
+            // attempt any resending if the request fails or times out.
+            sendLeaveGroupRequest();
+        }
+
+        this.generation = OffsetCommitRequest.DEFAULT_GENERATION_ID;
+        this.memberId = JoinGroupRequest.UNKNOWN_MEMBER_ID;
+        rejoinNeeded = true;
+    }
+
+    private void sendLeaveGroupRequest() {
+        LeaveGroupRequest request = new LeaveGroupRequest(groupId, memberId);
+        RequestFuture<Void> future = client.send(coordinator, ApiKeys.LEAVE_GROUP, request)
+                .compose(new LeaveGroupResponseHandler());
+
+        future.addListener(new RequestFutureListener<Void>() {
+            @Override
+            public void onSuccess(Void value) {}
+
+            @Override
+            public void onFailure(RuntimeException e) {
+                log.debug("LeaveGroup request for group {} failed with error", groupId, e);
+            }
+        });
+
+        client.poll(future, 0);
+    }
+
+    private class LeaveGroupResponseHandler extends CoordinatorResponseHandler<LeaveGroupResponse, Void> {
+        @Override
+        public LeaveGroupResponse parse(ClientResponse response) {
+            return new LeaveGroupResponse(response.responseBody());
+        }
+
+        @Override
+        public void handle(LeaveGroupResponse leaveResponse, RequestFuture<Void> future) {
+            // process the response
+            short errorCode = leaveResponse.errorCode();
+            if (errorCode == Errors.NONE.code())
+                future.complete(null);
+            else
+                future.raise(Errors.forCode(errorCode));
         }
     }
 
@@ -511,31 +624,33 @@ public abstract class AbstractCoordinator {
         @Override
         public void handle(HeartbeatResponse heartbeatResponse, RequestFuture<Void> future) {
             sensors.heartbeatLatency.record(response.requestLatencyMs());
-            short error = heartbeatResponse.errorCode();
-            if (error == Errors.NONE.code()) {
-                log.debug("Received successful heartbeat response.");
+            Errors error = Errors.forCode(heartbeatResponse.errorCode());
+            if (error == Errors.NONE) {
+                log.debug("Received successful heartbeat response for group {}", groupId);
                 future.complete(null);
-            } else if (error == Errors.GROUP_COORDINATOR_NOT_AVAILABLE.code()
-                    || error == Errors.NOT_COORDINATOR_FOR_GROUP.code()) {
-                log.info("Attempt to heart beat failed since coordinator is either not started or not valid, marking it as dead.");
+            } else if (error == Errors.GROUP_COORDINATOR_NOT_AVAILABLE
+                    || error == Errors.NOT_COORDINATOR_FOR_GROUP) {
+                log.debug("Attempt to heart beat failed for group {} since coordinator {} is either not started or not valid.",
+                        groupId, coordinator);
                 coordinatorDead();
-                future.raise(Errors.forCode(error));
-            } else if (error == Errors.REBALANCE_IN_PROGRESS.code()) {
-                log.info("Attempt to heart beat failed since the group is rebalancing, try to re-join group.");
+                future.raise(error);
+            } else if (error == Errors.REBALANCE_IN_PROGRESS) {
+                log.debug("Attempt to heart beat failed for group {} since it is rebalancing.", groupId);
                 AbstractCoordinator.this.rejoinNeeded = true;
                 future.raise(Errors.REBALANCE_IN_PROGRESS);
-            } else if (error == Errors.ILLEGAL_GENERATION.code()) {
-                log.info("Attempt to heart beat failed since generation id is not legal, try to re-join group.");
+            } else if (error == Errors.ILLEGAL_GENERATION) {
+                log.debug("Attempt to heart beat failed for group {} since generation id is not legal.", groupId);
                 AbstractCoordinator.this.rejoinNeeded = true;
                 future.raise(Errors.ILLEGAL_GENERATION);
-            } else if (error == Errors.UNKNOWN_MEMBER_ID.code()) {
-                log.info("Attempt to heart beat failed since member id is not valid, reset it and try to re-join group.");
+            } else if (error == Errors.UNKNOWN_MEMBER_ID) {
+                log.debug("Attempt to heart beat failed for group {} since member id is not valid.", groupId);
                 memberId = JoinGroupRequest.UNKNOWN_MEMBER_ID;
                 AbstractCoordinator.this.rejoinNeeded = true;
                 future.raise(Errors.UNKNOWN_MEMBER_ID);
+            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
+                future.raise(new GroupAuthorizationException(groupId));
             } else {
-                future.raise(new KafkaException("Unexpected error in heartbeat response: "
-                        + Errors.forCode(error).exception().getMessage()));
+                future.raise(new KafkaException("Unexpected error in heartbeat response: " + error.message()));
             }
         }
     }
@@ -549,24 +664,23 @@ public abstract class AbstractCoordinator {
         public abstract void handle(R response, RequestFuture<T> future);
 
         @Override
-        public void onSuccess(ClientResponse clientResponse, RequestFuture<T> future) {
-            this.response = clientResponse;
-
-            if (clientResponse.wasDisconnected()) {
-                int correlation = response.request().request().header().correlationId();
-                log.debug("Cancelled request {} with correlation id {} due to coordinator {} being disconnected",
-                        response.request(),
-                        correlation,
-                        response.request().request().destination());
-
-                // mark the coordinator as dead
+        public void onFailure(RuntimeException e, RequestFuture<T> future) {
+            // mark the coordinator as dead
+            if (e instanceof DisconnectException)
                 coordinatorDead();
-                future.raise(new DisconnectException());
-                return;
-            }
+            future.raise(e);
+        }
 
-            R response = parse(clientResponse);
-            handle(response, future);
+        @Override
+        public void onSuccess(ClientResponse clientResponse, RequestFuture<T> future) {
+            try {
+                this.response = clientResponse;
+                R responseObj = parse(clientResponse);
+                handle(responseObj, future);
+            } catch (RuntimeException e) {
+                if (!future.isDone())
+                    future.raise(e);
+            }
         }
 
     }
@@ -579,47 +693,39 @@ public abstract class AbstractCoordinator {
         public final Sensor joinLatency;
         public final Sensor syncLatency;
 
-        public GroupCoordinatorMetrics(Metrics metrics, String metricGrpPrefix, Map<String, String> tags) {
+        public GroupCoordinatorMetrics(Metrics metrics, String metricGrpPrefix) {
             this.metrics = metrics;
             this.metricGrpName = metricGrpPrefix + "-coordinator-metrics";
 
             this.heartbeatLatency = metrics.sensor("heartbeat-latency");
-            this.heartbeatLatency.add(new MetricName("heartbeat-response-time-max",
+            this.heartbeatLatency.add(metrics.metricName("heartbeat-response-time-max",
                 this.metricGrpName,
-                "The max time taken to receive a response to a heartbeat request",
-                tags), new Max());
-            this.heartbeatLatency.add(new MetricName("heartbeat-rate",
+                "The max time taken to receive a response to a heartbeat request"), new Max());
+            this.heartbeatLatency.add(metrics.metricName("heartbeat-rate",
                 this.metricGrpName,
-                "The average number of heartbeats per second",
-                tags), new Rate(new Count()));
+                "The average number of heartbeats per second"), new Rate(new Count()));
 
             this.joinLatency = metrics.sensor("join-latency");
-            this.joinLatency.add(new MetricName("join-time-avg",
+            this.joinLatency.add(metrics.metricName("join-time-avg",
                     this.metricGrpName,
-                    "The average time taken for a group rejoin",
-                    tags), new Avg());
-            this.joinLatency.add(new MetricName("join-time-max",
+                    "The average time taken for a group rejoin"), new Avg());
+            this.joinLatency.add(metrics.metricName("join-time-max",
                     this.metricGrpName,
-                    "The max time taken for a group rejoin",
-                    tags), new Avg());
-            this.joinLatency.add(new MetricName("join-rate",
+                    "The max time taken for a group rejoin"), new Avg());
+            this.joinLatency.add(metrics.metricName("join-rate",
                     this.metricGrpName,
-                    "The number of group joins per second",
-                    tags), new Rate(new Count()));
+                    "The number of group joins per second"), new Rate(new Count()));
 
             this.syncLatency = metrics.sensor("sync-latency");
-            this.syncLatency.add(new MetricName("sync-time-avg",
+            this.syncLatency.add(metrics.metricName("sync-time-avg",
                     this.metricGrpName,
-                    "The average time taken for a group sync",
-                    tags), new Avg());
-            this.syncLatency.add(new MetricName("sync-time-max",
+                    "The average time taken for a group sync"), new Avg());
+            this.syncLatency.add(metrics.metricName("sync-time-max",
                     this.metricGrpName,
-                    "The max time taken for a group sync",
-                    tags), new Avg());
-            this.syncLatency.add(new MetricName("sync-rate",
+                    "The max time taken for a group sync"), new Avg());
+            this.syncLatency.add(metrics.metricName("sync-rate",
                     this.metricGrpName,
-                    "The number of group syncs per second",
-                    tags), new Rate(new Count()));
+                    "The number of group syncs per second"), new Rate(new Count()));
 
             Measurable lastHeartbeat =
                 new Measurable() {
@@ -627,10 +733,9 @@ public abstract class AbstractCoordinator {
                         return TimeUnit.SECONDS.convert(now - heartbeat.lastHeartbeatSend(), TimeUnit.MILLISECONDS);
                     }
                 };
-            metrics.addMetric(new MetricName("last-heartbeat-seconds-ago",
+            metrics.addMetric(metrics.metricName("last-heartbeat-seconds-ago",
                 this.metricGrpName,
-                "The number of seconds since the last controller heartbeat",
-                tags),
+                "The number of seconds since the last controller heartbeat"),
                 lastHeartbeat);
         }
     }

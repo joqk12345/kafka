@@ -17,7 +17,22 @@
 
 package org.apache.kafka.streams.processor;
 
+/**
+ * A processor supplier that can create one or more {@link Processor} instances.
+ *
+ * It is used in {@link TopologyBuilder} for adding new processor operators, whose generated
+ * topology can then be replicated (and thus creating one or more {@link Processor} instances)
+ * and distributed to multiple stream threads.
+ *
+ * @param <K> the type of keys
+ * @param <V> the type of values
+ */
 public interface ProcessorSupplier<K, V> {
 
+    /**
+     * Return a new {@link Processor} instance.
+     *
+     * @return  a new {@link Processor} instance
+     */
     Processor<K, V> get();
 }

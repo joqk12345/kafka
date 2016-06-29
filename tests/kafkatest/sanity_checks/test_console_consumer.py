@@ -13,17 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
+
+from ducktape.mark import matrix
+from ducktape.mark import parametrize
 from ducktape.tests.test import Test
 from ducktape.utils.util import wait_until
-from ducktape.mark import parametrize
-from ducktape.mark import matrix
 
-from kafkatest.services.zookeeper import ZookeeperService
-from kafkatest.services.kafka import KafkaService
 from kafkatest.services.console_consumer import ConsoleConsumer
+from kafkatest.services.kafka import KafkaService
+from kafkatest.services.verifiable_producer import VerifiableProducer
+from kafkatest.services.zookeeper import ZookeeperService
 from kafkatest.utils.remote_account import line_count, file_exists
+from kafkatest.version import LATEST_0_8_2
 
-import time
 
 class ConsoleConsumerTest(Test):
     """Sanity checks on console consumer service class."""
@@ -32,24 +35,32 @@ class ConsoleConsumerTest(Test):
 
         self.topic = "topic"
         self.zk = ZookeeperService(test_context, num_nodes=1)
+        self.kafka = KafkaService(self.test_context, num_nodes=1, zk=self.zk,
+                                  topics={self.topic: {"partitions": 1, "replication-factor": 1}})
+        self.consumer = ConsoleConsumer(self.test_context, num_nodes=1, kafka=self.kafka, topic=self.topic)
 
     def setUp(self):
         self.zk.start()
 
-    @parametrize(security_protocol='SSL', new_consumer=True)
-    @matrix(security_protocol=['PLAINTEXT'], new_consumer=[False, True])
-    def test_lifecycle(self, security_protocol, new_consumer):
-        self.kafka = KafkaService(self.test_context, num_nodes=1, zk=self.zk,
-                                  security_protocol=security_protocol,
-                                  topics={self.topic: {"partitions": 1, "replication-factor": 1}})
+    @parametrize(security_protocol='PLAINTEXT', new_consumer=False)
+    @parametrize(security_protocol='SASL_SSL', sasl_mechanism='PLAIN')
+    @matrix(security_protocol=['PLAINTEXT', 'SSL', 'SASL_PLAINTEXT', 'SASL_SSL'])
+    def test_lifecycle(self, security_protocol, new_consumer=True, sasl_mechanism='GSSAPI'):
+        """Check that console consumer starts/stops properly, and that we are capturing log output."""
+
+        self.kafka.security_protocol = security_protocol
+        self.kafka.client_sasl_mechanism = sasl_mechanism
+        self.kafka.interbroker_sasl_mechanism = sasl_mechanism
         self.kafka.start()
 
+        self.consumer.security_protocol = security_protocol
+        self.consumer.new_consumer = new_consumer
+
         t0 = time.time()
-        self.consumer = ConsoleConsumer(self.test_context, num_nodes=1, kafka=self.kafka, topic=self.topic, security_protocol=security_protocol, new_consumer=new_consumer)
         self.consumer.start()
         node = self.consumer.nodes[0]
 
-        wait_until(lambda: self.consumer.alive(node), 
+        wait_until(lambda: self.consumer.alive(node),
             timeout_sec=10, backoff_sec=.2, err_msg="Consumer was too slow to start")
         self.logger.info("consumer started in %s seconds " % str(time.time() - t0))
 
@@ -62,3 +73,22 @@ class ConsoleConsumerTest(Test):
         assert line_count(node, ConsoleConsumer.STDOUT_CAPTURE) == 0
 
         self.consumer.stop_node(node)
+
+    def test_version(self):
+        """Check that console consumer v0.8.2.X successfully starts and consumes messages."""
+        self.kafka.start()
+
+        num_messages = 1000
+        self.producer = VerifiableProducer(self.test_context, num_nodes=1, kafka=self.kafka, topic=self.topic,
+                                           max_messages=num_messages, throughput=1000)
+        self.producer.start()
+        self.producer.wait()
+
+        self.consumer.nodes[0].version = LATEST_0_8_2
+        self.consumer.consumer_timeout_ms = 1000
+        self.consumer.start()
+        self.consumer.wait()
+
+        num_consumed = len(self.consumer.messages_consumed[1])
+        num_produced = self.producer.num_acked
+        assert num_produced == num_consumed, "num_produced: %d, num_consumed: %d" % (num_produced, num_consumed)

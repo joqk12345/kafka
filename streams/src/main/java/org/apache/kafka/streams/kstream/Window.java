@@ -17,20 +17,67 @@
 
 package org.apache.kafka.streams.kstream;
 
-import org.apache.kafka.streams.processor.ProcessorContext;
-import org.apache.kafka.streams.processor.StateStore;
+/**
+ * A single window instance, defined by its start and end timestamp.
+ */
+public abstract class Window {
 
-import java.util.Iterator;
+    private long start;
+    private long end;
 
-public interface Window<K, V> extends StateStore {
+    /**
+     * Create a new window for the given start time (inclusive) and end time (exclusive).
+     *
+     * @param start  the start timestamp of the window (inclusive)
+     * @param end    the end timestamp of the window (exclusive)
+     */
+    public Window(long start, long end) {
+        this.start = start;
+        this.end = end;
+    }
 
-    void init(ProcessorContext context);
+    /**
+     * Return the start timestamp of this window, inclusive
+     */
+    public long start() {
+        return start;
+    }
 
-    Iterator<V> find(K key, long timestamp);
+    /**
+     * Return the end timestamp of this window, exclusive
+     */
+    public long end() {
+        return end;
+    }
 
-    Iterator<V> findAfter(K key, long timestamp);
+    /**
+     * Check if the given window overlaps with this window.
+     *
+     * @param other  another window
+     * @return       {@code true} if {@code other} overlaps with this window&mdash;{@code false} otherwise
+     */
+    public boolean overlap(Window other) {
+        return this.start() < other.end() || other.start() < this.end();
+    }
 
-    Iterator<V> findBefore(K key, long timestamp);
+    @Override
+    public boolean equals(Object obj) {
+        if (obj == this) {
+            return true;
+        }
 
-    void put(K key, V value, long timestamp);
+        if (getClass() != obj.getClass()) {
+            return false;
+        }
+
+        Window other = (Window) obj;
+        return this.start == other.start && this.end == other.end;
+    }
+
+    @Override
+    public int hashCode() {
+        long n = (this.start << 32) | this.end;
+        return (int) (n % 0xFFFFFFFFL);
+    }
+
 }

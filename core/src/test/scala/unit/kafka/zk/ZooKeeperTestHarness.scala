@@ -17,30 +17,36 @@
 
 package kafka.zk
 
-import org.I0Itec.zkclient.{ZkClient, ZkConnection}
-import kafka.utils.{ZkUtils, CoreUtils}
+import javax.security.auth.login.Configuration
+import kafka.utils.{ZkUtils, Logging, CoreUtils}
 import org.junit.{After, Before}
 import org.scalatest.junit.JUnitSuite
+import org.apache.kafka.common.security.JaasUtils
 
-trait ZooKeeperTestHarness extends JUnitSuite {
-  var zkPort: Int = -1
-  var zookeeper: EmbeddedZookeeper = null
-  var zkUtils: ZkUtils = null
+trait ZooKeeperTestHarness extends JUnitSuite with Logging {
+
   val zkConnectionTimeout = 6000
   val zkSessionTimeout = 6000
-  def zkConnect: String = "127.0.0.1:" + zkPort
 
+  var zkUtils: ZkUtils = null
+  var zookeeper: EmbeddedZookeeper = null
+
+  def zkPort: Int = zookeeper.port
+  def zkConnect: String = s"127.0.0.1:$zkPort"
+  
   @Before
   def setUp() {
     zookeeper = new EmbeddedZookeeper()
-    zkPort = zookeeper.port
-    zkUtils = ZkUtils.apply(zkConnect, zkSessionTimeout, zkConnectionTimeout, false)
+    zkUtils = ZkUtils(zkConnect, zkSessionTimeout, zkConnectionTimeout, JaasUtils.isZkSecurityEnabled())
   }
 
   @After
   def tearDown() {
-    CoreUtils.swallow(zkUtils.close())
-    CoreUtils.swallow(zookeeper.shutdown())
+    if (zkUtils != null)
+     CoreUtils.swallow(zkUtils.close())
+    if (zookeeper != null)
+      CoreUtils.swallow(zookeeper.shutdown())
+    Configuration.setConfiguration(null)
   }
 
 }

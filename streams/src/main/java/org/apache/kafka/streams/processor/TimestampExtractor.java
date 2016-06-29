@@ -20,15 +20,18 @@ package org.apache.kafka.streams.processor;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
 /**
- * An interface that allows the KStream framework to extract a timestamp from a key-value pair
+ * An interface that allows the Kafka Streams framework to extract a timestamp from an instance of {@link ConsumerRecord}.
+ * The extracted timestamp is defined as milliseconds.
  */
 public interface TimestampExtractor {
 
     /**
-     * Extracts a timestamp from a message
+     * Extracts a timestamp from a record.
+     * <p>
+     * Typically, the timestamp represents the milliseconds since midnight, January 1, 1970 UTC.
      *
-     * @param record ConsumerRecord
-     * @return timestamp
+     * @param record  a data record
+     * @return        the timestamp of the record
      */
     long extract(ConsumerRecord<Object, Object> record);
 }

@@ -19,6 +19,8 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.streams.errors.StreamsException;
 import org.apache.kafka.streams.processor.TimestampExtractor;
 
 import java.util.ArrayDeque;
@@ -76,14 +78,30 @@ public class RecordQueue {
             Object key = source.deserializeKey(rawRecord.topic(), rawRecord.key());
             Object value = source.deserializeValue(rawRecord.topic(), rawRecord.value());
 
-            ConsumerRecord<Object, Object> record = new ConsumerRecord<>(rawRecord.topic(), rawRecord.partition(), rawRecord.offset(), key, value);
+            ConsumerRecord<Object, Object> record = new ConsumerRecord<>(rawRecord.topic(), rawRecord.partition(), rawRecord.offset(),
+                                                                         rawRecord.timestamp(), TimestampType.CREATE_TIME,
+                                                                         rawRecord.checksum(),
+                                                                         rawRecord.serializedKeySize(),
+                                                                         rawRecord.serializedValueSize(), key, value);
             long timestamp = timestampExtractor.extract(record);
+
+            // validate that timestamp must be non-negative
+            if (timestamp < 0)
+                throw new StreamsException("Extracted timestamp value is negative, which is not allowed.");
 
             StampedRecord stampedRecord = new StampedRecord(record, timestamp);
 
             fifoQueue.addLast(stampedRecord);
             timeTracker.addElement(stampedRecord);
         }
+
+        // update the partition timestamp if its currently
+        // tracked min timestamp has exceed its value; this will
+        // usually only take effect for the first added batch
+        long timestamp = timeTracker.get();
+
+        if (timestamp > partitionTime)
+            partitionTime = timestamp;
 
         return size();
     }

@@ -18,7 +18,6 @@
 package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.streams.processor.TimestampExtractor;
 
@@ -49,6 +48,10 @@ public class PartitionGroup {
 
         public TopicPartition partition() {
             return queue.partition();
+        }
+
+        public RecordQueue queue() {
+            return queue;
         }
     }
 
@@ -89,7 +92,7 @@ public class PartitionGroup {
             // get the first record from this queue.
             record = queue.poll();
 
-            if (queue.size() > 0) {
+            if (!queue.isEmpty()) {
                 queuesByTime.offer(queue);
             }
         }
@@ -132,24 +135,24 @@ public class PartitionGroup {
      * partition timestamp among all its partitions
      */
     public long timestamp() {
-        if (queuesByTime.isEmpty()) {
-            // if there is no data in all partitions, return the smallest of their last known times
-            long timestamp = Long.MAX_VALUE;
-            for (RecordQueue queue : partitionQueues.values()) {
-                if (timestamp > queue.timestamp())
-                    timestamp = queue.timestamp();
-            }
-            return timestamp;
-        } else {
-            return queuesByTime.peek().timestamp();
+        // we should always return the smallest timestamp of all partitions
+        // to avoid group partition time goes backward
+        long timestamp = Long.MAX_VALUE;
+        for (RecordQueue queue : partitionQueues.values()) {
+            if (timestamp > queue.timestamp())
+                timestamp = queue.timestamp();
         }
+        return timestamp;
     }
 
+    /**
+     * @throws IllegalStateException if the record's partition does not belong to this partition group
+     */
     public int numBuffered(TopicPartition partition) {
         RecordQueue recordQueue = partitionQueues.get(partition);
 
         if (recordQueue == null)
-            throw new KafkaException("Record's partition does not belong to this partition-group.");
+            throw new IllegalStateException("Record's partition does not belong to this partition-group.");
 
         return recordQueue.size();
     }

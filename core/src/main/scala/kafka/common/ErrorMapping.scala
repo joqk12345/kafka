@@ -57,9 +57,14 @@ object ErrorMapping {
   // 24: UNKNOWN_PARTITION_ASSIGNMENT_STRATEGY
   // 25: UNKNOWN_CONSUMER_ID
   // 26: INVALID_SESSION_TIMEOUT
-  // 27: COMMITTING_PARTITIONS_NOT_ASSIGNED
+  // 27: REBALANCE_IN_PROGRESS
   // 28: INVALID_COMMIT_OFFSET_SIZE
-  val AuthorizationCode: Short = 29;
+  val TopicAuthorizationCode: Short = 29
+  val GroupAuthorizationCode: Short = 30
+  val ClusterAuthorizationCode: Short = 31
+  // 32: INVALID_TIMESTAMP
+  // 33: UNSUPPORTED_SASL_MECHANISM
+  // 34: ILLEGAL_SASL_STATE
 
   private val exceptionToCode =
     Map[Class[Throwable], Short](
@@ -67,8 +72,8 @@ object ErrorMapping {
       classOf[InvalidMessageException].asInstanceOf[Class[Throwable]] -> InvalidMessageCode,
       classOf[UnknownTopicOrPartitionException].asInstanceOf[Class[Throwable]] -> UnknownTopicOrPartitionCode,
       classOf[InvalidMessageSizeException].asInstanceOf[Class[Throwable]] -> InvalidFetchSizeCode,
-      classOf[NotLeaderForPartitionException].asInstanceOf[Class[Throwable]] -> NotLeaderForPartitionCode,
       classOf[LeaderNotAvailableException].asInstanceOf[Class[Throwable]] -> LeaderNotAvailableCode,
+      classOf[NotLeaderForPartitionException].asInstanceOf[Class[Throwable]] -> NotLeaderForPartitionCode,
       classOf[RequestTimedOutException].asInstanceOf[Class[Throwable]] -> RequestTimedOutCode,
       classOf[BrokerNotAvailableException].asInstanceOf[Class[Throwable]] -> BrokerNotAvailableCode,
       classOf[ReplicaNotAvailableException].asInstanceOf[Class[Throwable]] -> ReplicaNotAvailableCode,
@@ -82,7 +87,9 @@ object ErrorMapping {
       classOf[MessageSetSizeTooLargeException].asInstanceOf[Class[Throwable]] -> MessageSetSizeTooLargeCode,
       classOf[NotEnoughReplicasException].asInstanceOf[Class[Throwable]] -> NotEnoughReplicasCode,
       classOf[NotEnoughReplicasAfterAppendException].asInstanceOf[Class[Throwable]] -> NotEnoughReplicasAfterAppendCode,
-      classOf[AuthorizationException].asInstanceOf[Class[Throwable]] -> AuthorizationCode
+      classOf[TopicAuthorizationException].asInstanceOf[Class[Throwable]] -> TopicAuthorizationCode,
+      classOf[GroupAuthorizationException].asInstanceOf[Class[Throwable]] -> GroupAuthorizationCode,
+      classOf[ClusterAuthorizationException].asInstanceOf[Class[Throwable]] -> ClusterAuthorizationCode
     ).withDefaultValue(UnknownCode)
 
   /* invert the mapping */

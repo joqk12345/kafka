@@ -16,13 +16,10 @@ import java.nio.channels.SelectionKey;
 import java.util.Map;
 
 import org.apache.kafka.common.security.auth.PrincipalBuilder;
-import org.apache.kafka.common.config.SSLConfigs;
-import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.common.KafkaException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 
 public class PlaintextChannelBuilder implements ChannelBuilder {
     private static final Logger log = LoggerFactory.getLogger(PlaintextChannelBuilder.class);
@@ -32,8 +29,7 @@ public class PlaintextChannelBuilder implements ChannelBuilder {
     public void configure(Map<String, ?> configs) throws KafkaException {
         try {
             this.configs = configs;
-            this.principalBuilder = (PrincipalBuilder) Utils.newInstance((Class<?>) configs.get(SSLConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG));
-            this.principalBuilder.configure(this.configs);
+            principalBuilder = ChannelBuilders.createPrincipalBuilder(configs);
         } catch (Exception e) {
             throw new KafkaException(e);
         }

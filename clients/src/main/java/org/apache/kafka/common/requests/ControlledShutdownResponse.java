@@ -19,7 +19,10 @@ import org.apache.kafka.common.protocol.types.Schema;
 import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 public class ControlledShutdownResponse extends AbstractRequestResponse {
 
@@ -52,6 +55,7 @@ public class ControlledShutdownResponse extends AbstractRequestResponse {
             Struct topicPartitionStruct = struct.instance(PARTITIONS_REMAINING_KEY_NAME);
             topicPartitionStruct.set(TOPIC_KEY_NAME, topicPartition.topic());
             topicPartitionStruct.set(PARTITION_KEY_NAME, topicPartition.partition());
+            partitionsRemainingList.add(topicPartitionStruct);
         }
         struct.set(PARTITIONS_REMAINING_KEY_NAME, partitionsRemainingList.toArray());
 
@@ -81,7 +85,7 @@ public class ControlledShutdownResponse extends AbstractRequestResponse {
     }
 
     public static ControlledShutdownResponse parse(ByteBuffer buffer) {
-        return new ControlledShutdownResponse((Struct) CURRENT_SCHEMA.read(buffer));
+        return new ControlledShutdownResponse(CURRENT_SCHEMA.read(buffer));
     }
 
     public static ControlledShutdownResponse parse(ByteBuffer buffer, int version) {

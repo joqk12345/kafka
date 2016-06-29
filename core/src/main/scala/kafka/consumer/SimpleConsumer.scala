@@ -91,7 +91,7 @@ class SimpleConsumer(val host: String,
         case e: AsynchronousCloseException =>
           throw e
         case e : Throwable =>
-          info("Reconnect due to socket error: %s".format(e.toString))
+          info("Reconnect due to error:", e)
           // retry once
           try {
             reconnect()
@@ -112,9 +112,9 @@ class SimpleConsumer(val host: String,
     TopicMetadataResponse.readFrom(response.payload())
   }
 
-  def send(request: GroupMetadataRequest): GroupMetadataResponse = {
+  def send(request: GroupCoordinatorRequest): GroupCoordinatorResponse = {
     val response = sendRequest(request)
-    GroupMetadataResponse.readFrom(response.payload())
+    GroupCoordinatorResponse.readFrom(response.payload())
   }
 
   /**

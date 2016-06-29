@@ -17,15 +17,15 @@
 
 package org.apache.kafka.streams.kstream.internals;
 
-import org.apache.kafka.common.serialization.Deserializer;
-import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.kstream.JoinWindows;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KStreamBuilder;
 import org.apache.kafka.streams.kstream.Predicate;
 import org.apache.kafka.streams.kstream.ValueJoiner;
 import org.apache.kafka.streams.kstream.ValueMapper;
 import org.apache.kafka.test.MockProcessorSupplier;
-import org.apache.kafka.test.UnlimitedWindowDef;
 import org.junit.Test;
 
 import java.util.Collections;
@@ -35,14 +35,16 @@ import static org.junit.Assert.assertEquals;
 
 public class KStreamImplTest {
 
+    final private Serde<String> stringSerde = Serdes.String();
+    final private Serde<Integer> intSerde = Serdes.Integer();
+
     @Test
     public void testNumProcesses() {
-        final Deserializer<String> deserializer = new StringDeserializer();
         final KStreamBuilder builder = new KStreamBuilder();
 
-        KStream<String, String> source1 = builder.from(deserializer, deserializer, "topic-1", "topic-2");
+        KStream<String, String> source1 = builder.stream(stringSerde, stringSerde, "topic-1", "topic-2");
 
-        KStream<String, String> source2 = builder.from(deserializer, deserializer, "topic-3", "topic-4");
+        KStream<String, String> source2 = builder.stream(stringSerde, stringSerde, "topic-3", "topic-4");
 
         KStream<String, String> stream1 =
             source1.filter(new Predicate<String, String>() {
@@ -50,7 +52,7 @@ public class KStreamImplTest {
                 public boolean test(String key, String value) {
                     return true;
                 }
-            }).filterOut(new Predicate<String, String>() {
+            }).filterNot(new Predicate<String, String>() {
                 @Override
                 public boolean test(String key, String value) {
                     return false;
@@ -72,54 +74,53 @@ public class KStreamImplTest {
         });
 
         KStream<String, Integer>[] streams2 = stream2.branch(
-            new Predicate<String, Integer>() {
-                @Override
-                public boolean test(String key, Integer value) {
-                    return (value % 2) == 0;
+                new Predicate<String, Integer>() {
+                    @Override
+                    public boolean test(String key, Integer value) {
+                        return (value % 2) == 0;
+                    }
+                },
+                new Predicate<String, Integer>() {
+                    @Override
+                    public boolean test(String key, Integer value) {
+                        return true;
+                    }
                 }
-            },
-            new Predicate<String, Integer>() {
-                @Override
-                public boolean test(String key, Integer value) {
-                    return true;
-                }
-            }
         );
 
         KStream<String, Integer>[] streams3 = stream3.branch(
-            new Predicate<String, Integer>() {
-                @Override
-                public boolean test(String key, Integer value) {
-                    return (value % 2) == 0;
+                new Predicate<String, Integer>() {
+                    @Override
+                    public boolean test(String key, Integer value) {
+                        return (value % 2) == 0;
+                    }
+                },
+                new Predicate<String, Integer>() {
+                    @Override
+                    public boolean test(String key, Integer value) {
+                        return true;
+                    }
                 }
-            },
-            new Predicate<String, Integer>() {
-                @Override
-                public boolean test(String key, Integer value) {
-                    return true;
-                }
-            }
         );
 
-        KStream<String, Integer> stream4 = streams2[0].with(new UnlimitedWindowDef<String, Integer>("window"))
-            .join(streams3[0].with(new UnlimitedWindowDef<String, Integer>("window")), new ValueJoiner<Integer, Integer, Integer>() {
-                @Override
-                public Integer apply(Integer value1, Integer value2) {
-                    return value1 + value2;
-                }
-            });
+        final int anyWindowSize = 1;
+        KStream<String, Integer> stream4 = streams2[0].join(streams3[0], new ValueJoiner<Integer, Integer, Integer>() {
+            @Override
+            public Integer apply(Integer value1, Integer value2) {
+                return value1 + value2;
+            }
+        }, JoinWindows.of("join-0", anyWindowSize), stringSerde, intSerde, intSerde);
 
-        KStream<String, Integer> stream5 = streams2[1].with(new UnlimitedWindowDef<String, Integer>("window"))
-            .join(streams3[1].with(new UnlimitedWindowDef<String, Integer>("window")), new ValueJoiner<Integer, Integer, Integer>() {
-                @Override
-                public Integer apply(Integer value1, Integer value2) {
-                    return value1 + value2;
-                }
-            });
+        KStream<String, Integer> stream5 = streams2[1].join(streams3[1], new ValueJoiner<Integer, Integer, Integer>() {
+            @Override
+            public Integer apply(Integer value1, Integer value2) {
+                return value1 + value2;
+            }
+        }, JoinWindows.of("join-1", anyWindowSize), stringSerde, intSerde, intSerde);
 
         stream4.to("topic-5");
 
-        stream5.through("topic-6").process(new MockProcessorSupplier<>());
+        streams2[1].through("topic-6").process(new MockProcessorSupplier<String, Integer>());
 
         assertEquals(2 + // sources
             2 + // stream1
@@ -127,11 +128,17 @@ public class KStreamImplTest {
             1 + // stream3
             1 + 2 + // streams2
             1 + 2 + // streams3
-            2 + 3 + // stream4
-            2 + 3 + // stream5
+            5 * 2 + // stream2-stream3 joins
             1 + // to
             2 + // through
             1, // process
-            builder.build().processors().size());
+            builder.build("X", null).processors().size());
+    }
+
+    @Test
+    public void testToWithNullValueSerdeDoesntNPE() {
+        final KStreamBuilder builder = new KStreamBuilder();
+        final KStream<String, String> inputStream = builder.stream(stringSerde, stringSerde, "input");
+        inputStream.to(stringSerde, null, "output");
     }
 }

@@ -19,6 +19,8 @@
 
 package org.apache.kafka.streams.state;
 
+import org.apache.kafka.common.annotation.InterfaceStability;
+import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.processor.StateStore;
 
 import java.util.List;
@@ -29,6 +31,7 @@ import java.util.List;
  * @param <K> The key type
  * @param <V> The value type
  */
+@InterfaceStability.Unstable
 public interface KeyValueStore<K, V> extends StateStore {
 
     /**
@@ -38,7 +41,7 @@ public interface KeyValueStore<K, V> extends StateStore {
      * @return The value or null if no value is found.
      * @throws NullPointerException If null is used for key.
      */
-    abstract public V get(K key);
+    V get(K key);
 
     /**
      * Update the value associated with this key
@@ -47,7 +50,18 @@ public interface KeyValueStore<K, V> extends StateStore {
      * @param value The value
      * @throws NullPointerException If null is used for key or value.
      */
-    abstract public void put(K key, V value);
+    void put(K key, V value);
+
+    /**
+     * Update the value associated with this key, unless a value
+     * is already associated with the key
+     *
+     * @param key They key to associate the value to
+     * @param value The value
+     * @return The old value or null if there is no such key.
+     * @throws NullPointerException If null is used for key or value.
+     */
+    V putIfAbsent(K key, V value);
 
     /**
      * Update all the given key/value pairs
@@ -55,7 +69,7 @@ public interface KeyValueStore<K, V> extends StateStore {
      * @param entries A list of entries to put into the store.
      * @throws NullPointerException If null is used for any key or value.
      */
-    abstract public void putAll(List<Entry<K, V>> entries);
+    void putAll(List<KeyValue<K, V>> entries);
 
     /**
      * Delete the value from the store (if there is one)
@@ -64,7 +78,7 @@ public interface KeyValueStore<K, V> extends StateStore {
      * @return The old value or null if there is no such key.
      * @throws NullPointerException If null is used for key.
      */
-    abstract public V delete(K key);
+    V delete(K key);
 
     /**
      * Get an iterator over a given range of keys. This iterator MUST be closed after use.
@@ -74,13 +88,23 @@ public interface KeyValueStore<K, V> extends StateStore {
      * @return The iterator for this range.
      * @throws NullPointerException If null is used for from or to.
      */
-    abstract public KeyValueIterator<K, V> range(K from, K to);
+    KeyValueIterator<K, V> range(K from, K to);
 
     /**
      * Return an iterator over all keys in the database. This iterator MUST be closed after use.
      *
      * @return An iterator of all key/value pairs in the store.
      */
-    abstract public KeyValueIterator<K, V> all();
+    KeyValueIterator<K, V> all();
+
+    /**
+     * Return an approximate count of key-value mappings in this store.
+     *
+     * The count is not guaranteed to be exact in order to accommodate stores
+     * where an exact count is expensive to calculate.
+     *
+     * @return an approximate count of key-value mappings in the store.
+     */
+    long approximateNumEntries();
 
 }

@@ -19,7 +19,7 @@ package org.apache.kafka.common.network;
 
 /*
  * Transport layer for underlying communication.
- * At very basic level it is wrapper around SocketChannel and can be used as substitue for SocketChannel
+ * At very basic level it is wrapper around SocketChannel and can be used as substitute for SocketChannel
  * and other network Channel implementations.
  * As NetworkClient replaces BlockingChannel and other implementations we will be using KafkaChannel as
  * a network I/O channel.
@@ -43,7 +43,7 @@ public interface TransportLayer extends ScatteringByteChannel, GatheringByteChan
     /**
      * Finishes the process of connecting a socket channel.
      */
-    void finishConnect() throws IOException;
+    boolean finishConnect() throws IOException;
 
     /**
      * disconnect socketChannel
@@ -74,7 +74,8 @@ public interface TransportLayer extends ScatteringByteChannel, GatheringByteChan
     boolean hasPendingWrites();
 
     /**
-     * Returns `SSLSession.getPeerPrincipal` if SSLTransportLayer is used and `KakfaPrincipal.ANONYMOUS` otherwise.
+     * Returns `SSLSession.getPeerPrincipal()` if this is a SslTransportLayer and there is an authenticated peer,
+     * `KafkaPrincipal.ANONYMOUS` is returned otherwise.
      */
     Principal peerPrincipal() throws IOException;
 

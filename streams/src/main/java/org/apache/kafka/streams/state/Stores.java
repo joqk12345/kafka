@@ -16,46 +16,44 @@
  */
 package org.apache.kafka.streams.state;
 
-import org.apache.kafka.common.serialization.ByteArrayDeserializer;
-import org.apache.kafka.common.serialization.ByteArraySerializer;
-import org.apache.kafka.common.serialization.Deserializer;
-import org.apache.kafka.common.serialization.IntegerDeserializer;
-import org.apache.kafka.common.serialization.IntegerSerializer;
-import org.apache.kafka.common.serialization.LongDeserializer;
-import org.apache.kafka.common.serialization.LongSerializer;
-import org.apache.kafka.common.serialization.Serializer;
-import org.apache.kafka.common.serialization.StringDeserializer;
-import org.apache.kafka.common.serialization.StringSerializer;
-import org.apache.kafka.streams.processor.ProcessorContext;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.streams.processor.StateStoreSupplier;
+import org.apache.kafka.streams.state.internals.InMemoryKeyValueStoreSupplier;
+import org.apache.kafka.streams.state.internals.InMemoryLRUCacheStoreSupplier;
+import org.apache.kafka.streams.state.internals.RocksDBKeyValueStoreSupplier;
+import org.apache.kafka.streams.state.internals.RocksDBWindowStoreSupplier;
+
+import java.nio.ByteBuffer;
 
 /**
- * Factory for creating key-value stores.
+ * Factory for creating state stores in Kafka Streams.
  */
 public class Stores {
 
     /**
-     * Begin to create a new {@link org.apache.kafka.streams.processor.StateStore} instance.
-     * 
+     * Begin to create a new {@link org.apache.kafka.streams.processor.StateStoreSupplier} instance.
+     *
      * @param name the name of the store
-     * @param context the processor context
      * @return the factory that can be used to specify other options or configurations for the store; never null
      */
-    public static StoreFactory create(final String name, final ProcessorContext context) {
+    public static StoreFactory create(final String name) {
         return new StoreFactory() {
             @Override
-            public <K> ValueFactory<K> withKeys(final Serializer<K> keySerializer, final Deserializer<K> keyDeserializer) {
+            public <K> ValueFactory<K> withKeys(final Serde<K> keySerde) {
                 return new ValueFactory<K>() {
                     @Override
-                    public <V> KeyValueFactory<K, V> withValues(final Serializer<V> valueSerializer,
-                                                                final Deserializer<V> valueDeserializer) {
-                        final Serdes<K, V> serdes = new Serdes<>(name, keySerializer, keyDeserializer, valueSerializer, valueDeserializer,
-                                context);
+                    public <V> KeyValueFactory<K, V> withValues(final Serde<V> valueSerde) {
                         return new KeyValueFactory<K, V>() {
                             @Override
                             public InMemoryKeyValueFactory<K, V> inMemory() {
                                 return new InMemoryKeyValueFactory<K, V>() {
                                     private int capacity = Integer.MAX_VALUE;
 
+                                    /**
+                                     * @param capacity the maximum capacity of the in-memory cache; should be one less than a power of 2
+                                     * @throws IllegalArgumentException if the capacity of the store is zero or negative
+                                     */
                                     @Override
                                     public InMemoryKeyValueFactory<K, V> maxEntries(int capacity) {
                                         if (capacity < 1) throw new IllegalArgumentException("The capacity must be positive");
@@ -64,21 +62,38 @@ public class Stores {
                                     }
 
                                     @Override
-                                    public KeyValueStore<K, V> build() {
+                                    public StateStoreSupplier build() {
                                         if (capacity < Integer.MAX_VALUE) {
-                                            return InMemoryLRUCacheStore.create(name, capacity, context, serdes, null);
+                                            return new InMemoryLRUCacheStoreSupplier<>(name, capacity, keySerde, valueSerde);
                                         }
-                                        return new InMemoryKeyValueStore<>(name, context, serdes, null);
+                                        return new InMemoryKeyValueStoreSupplier<>(name, keySerde, valueSerde);
                                     }
                                 };
                             }
 
                             @Override
-                            public LocalDatabaseKeyValueFactory<K, V> localDatabase() {
-                                return new LocalDatabaseKeyValueFactory<K, V>() {
+                            public PersistentKeyValueFactory<K, V> persistent() {
+                                return new PersistentKeyValueFactory<K, V>() {
+                                    private int numSegments = 0;
+                                    private long retentionPeriod = 0L;
+                                    private boolean retainDuplicates = false;
+
                                     @Override
-                                    public KeyValueStore<K, V> build() {
-                                        return new RocksDBKeyValueStore<>(name, context, serdes, null);
+                                    public PersistentKeyValueFactory<K, V> windowed(long retentionPeriod, int numSegments, boolean retainDuplicates) {
+                                        this.numSegments = numSegments;
+                                        this.retentionPeriod = retentionPeriod;
+                                        this.retainDuplicates = retainDuplicates;
+
+                                        return this;
+                                    }
+
+                                    @Override
+                                    public StateStoreSupplier build() {
+                                        if (numSegments > 0) {
+                                            return new RocksDBWindowStoreSupplier<>(name, retentionPeriod, numSegments, retainDuplicates, keySerde, valueSerde);
+                                        }
+
+                                        return new RocksDBKeyValueStoreSupplier<>(name, keySerde, valueSerde);
                                     }
                                 };
                             }
@@ -92,126 +107,154 @@ public class Stores {
     public static abstract class StoreFactory {
         /**
          * Begin to create a {@link KeyValueStore} by specifying the keys will be {@link String}s.
-         * 
+         *
          * @return the interface used to specify the type of values; never null
          */
         public ValueFactory<String> withStringKeys() {
-            return withKeys(new StringSerializer(), new StringDeserializer());
+            return withKeys(Serdes.String());
         }
 
         /**
          * Begin to create a {@link KeyValueStore} by specifying the keys will be {@link Integer}s.
-         * 
+         *
          * @return the interface used to specify the type of values; never null
          */
         public ValueFactory<Integer> withIntegerKeys() {
-            return withKeys(new IntegerSerializer(), new IntegerDeserializer());
+            return withKeys(Serdes.Integer());
         }
 
         /**
          * Begin to create a {@link KeyValueStore} by specifying the keys will be {@link Long}s.
-         * 
+         *
          * @return the interface used to specify the type of values; never null
          */
         public ValueFactory<Long> withLongKeys() {
-            return withKeys(new LongSerializer(), new LongDeserializer());
+            return withKeys(Serdes.Long());
+        }
+
+        /**
+         * Begin to create a {@link KeyValueStore} by specifying the keys will be {@link Double}s.
+         *
+         * @return the interface used to specify the type of values; never null
+         */
+        public ValueFactory<Double> withDoubleKeys() {
+            return withKeys(Serdes.Double());
+        }
+
+        /**
+         * Begin to create a {@link KeyValueStore} by specifying the keys will be {@link ByteBuffer}.
+         *
+         * @return the interface used to specify the type of values; never null
+         */
+        public ValueFactory<ByteBuffer> withByteBufferKeys() {
+            return withKeys(Serdes.ByteBuffer());
         }
 
         /**
          * Begin to create a {@link KeyValueStore} by specifying the keys will be byte arrays.
-         * 
+         *
          * @return the interface used to specify the type of values; never null
          */
         public ValueFactory<byte[]> withByteArrayKeys() {
-            return withKeys(new ByteArraySerializer(), new ByteArrayDeserializer());
+            return withKeys(Serdes.ByteArray());
         }
 
         /**
-         * Begin to create a {@link KeyValueStore} by specifying the keys will be either {@link String}, {@link Integer},
-         * {@link Long}, or {@code byte[]}.
-         * 
-         * @param keyClass the class for the keys, which must be one of the types for which Kafka has built-in serializers and
-         *            deserializers (e.g., {@code String.class}, {@code Integer.class}, {@code Long.class}, or
-         *            {@code byte[].class})
+         * Begin to create a {@link KeyValueStore} by specifying the keys.
+         *
+         * @param keyClass the class for the keys, which must be one of the types for which Kafka has built-in serdes
          * @return the interface used to specify the type of values; never null
          */
         public <K> ValueFactory<K> withKeys(Class<K> keyClass) {
-            return withKeys(Serdes.serializer(keyClass), Serdes.deserializer(keyClass));
+            return withKeys(Serdes.serdeFrom(keyClass));
         }
 
         /**
          * Begin to create a {@link KeyValueStore} by specifying the serializer and deserializer for the keys.
-         * 
-         * @param keySerializer the serializer for keys; may not be null
-         * @param keyDeserializer the deserializer for keys; may not be null
-         * @return the interface used to specify the type of values; never null
+         *
+         * @param keySerde  the serialization factory for keys; may be null
+         * @return          the interface used to specify the type of values; never null
          */
-        public abstract <K> ValueFactory<K> withKeys(Serializer<K> keySerializer, Deserializer<K> keyDeserializer);
+        public abstract <K> ValueFactory<K> withKeys(Serde<K> keySerde);
     }
 
     /**
      * The factory for creating off-heap key-value stores.
-     * 
+     *
      * @param <K> the type of keys
      */
     public static abstract class ValueFactory<K> {
         /**
          * Use {@link String} values.
-         * 
+         *
          * @return the interface used to specify the remaining key-value store options; never null
          */
         public KeyValueFactory<K, String> withStringValues() {
-            return withValues(new StringSerializer(), new StringDeserializer());
+            return withValues(Serdes.String());
         }
 
         /**
          * Use {@link Integer} values.
-         * 
+         *
          * @return the interface used to specify the remaining key-value store options; never null
          */
         public KeyValueFactory<K, Integer> withIntegerValues() {
-            return withValues(new IntegerSerializer(), new IntegerDeserializer());
+            return withValues(Serdes.Integer());
         }
 
         /**
          * Use {@link Long} values.
-         * 
+         *
          * @return the interface used to specify the remaining key-value store options; never null
          */
         public KeyValueFactory<K, Long> withLongValues() {
-            return withValues(new LongSerializer(), new LongDeserializer());
+            return withValues(Serdes.Long());
+        }
+
+        /**
+         * Use {@link Double} values.
+         *
+         * @return the interface used to specify the remaining key-value store options; never null
+         */
+        public KeyValueFactory<K, Double> withDoubleValues() {
+            return withValues(Serdes.Double());
+        }
+
+        /**
+         * Use {@link ByteBuffer} for values.
+         *
+         * @return the interface used to specify the remaining key-value store options; never null
+         */
+        public KeyValueFactory<K, ByteBuffer> withByteBufferValues() {
+            return withValues(Serdes.ByteBuffer());
         }
 
         /**
          * Use byte arrays for values.
-         * 
+         *
          * @return the interface used to specify the remaining key-value store options; never null
          */
         public KeyValueFactory<K, byte[]> withByteArrayValues() {
-            return withValues(new ByteArraySerializer(), new ByteArrayDeserializer());
+            return withValues(Serdes.ByteArray());
         }
 
         /**
-         * Use values of the specified type, which must be either {@link String}, {@link Integer}, {@link Long}, or {@code byte[]}
-         * .
-         * 
-         * @param valueClass the class for the values, which must be one of the types for which Kafka has built-in serializers and
-         *            deserializers (e.g., {@code String.class}, {@code Integer.class}, {@code Long.class}, or
-         *            {@code byte[].class})
+         * Use values of the specified type.
+         *
+         * @param valueClass the class for the values, which must be one of the types for which Kafka has built-in serdes
          * @return the interface used to specify the remaining key-value store options; never null
          */
         public <V> KeyValueFactory<K, V> withValues(Class<V> valueClass) {
-            return withValues(Serdes.serializer(valueClass), Serdes.deserializer(valueClass));
+            return withValues(Serdes.serdeFrom(valueClass));
         }
 
         /**
          * Use the specified serializer and deserializer for the values.
-         * 
-         * @param valueSerializer the serializer for value; may not be null
-         * @param valueDeserializer the deserializer for values; may not be null
-         * @return the interface used to specify the remaining key-value store options; never null
+         *
+         * @param valueSerde    the serialization factory for values; may be null
+         * @return              the interface used to specify the remaining key-value store options; never null
          */
-        public abstract <V> KeyValueFactory<K, V> withValues(Serializer<V> valueSerializer, Deserializer<V> valueDeserializer);
+        public abstract <V> KeyValueFactory<K, V> withValues(Serde<V> valueSerde);
     }
 
     /**
@@ -220,11 +263,11 @@ public class Stores {
      * @param <K> the type of keys
      * @param <V> the type of values
      */
-    public static interface KeyValueFactory<K, V> {
+    public interface KeyValueFactory<K, V> {
         /**
          * Keep all key-value entries in-memory, although for durability all entries are recorded in a Kafka topic that can be
          * read to restore the entries if they are lost.
-         * 
+         *
          * @return the factory to create in-memory key-value stores; never null
          */
         InMemoryKeyValueFactory<K, V> inMemory();
@@ -232,10 +275,10 @@ public class Stores {
         /**
          * Keep all key-value entries off-heap in a local database, although for durability all entries are recorded in a Kafka
          * topic that can be read to restore the entries if they are lost.
-         * 
+         *
          * @return the factory to create in-memory key-value stores; never null
          */
-        LocalDatabaseKeyValueFactory<K, V> localDatabase();
+        PersistentKeyValueFactory<K, V> persistent();
     }
 
     /**
@@ -244,11 +287,11 @@ public class Stores {
      * @param <K> the type of keys
      * @param <V> the type of values
      */
-    public static interface InMemoryKeyValueFactory<K, V> {
+    public interface InMemoryKeyValueFactory<K, V> {
         /**
          * Limits the in-memory key-value store to hold a maximum number of entries. The default is {@link Integer#MAX_VALUE}, which is
          * equivalent to not placing a limit on the number of entries.
-         * 
+         *
          * @param capacity the maximum capacity of the in-memory cache; should be one less than a power of 2
          * @return this factory
          * @throws IllegalArgumentException if the capacity is not positive
@@ -256,10 +299,10 @@ public class Stores {
         InMemoryKeyValueFactory<K, V> maxEntries(int capacity);
 
         /**
-         * Return the new key-value store.
-         * @return the key-value store; never null
+         * Return the instance of StateStoreSupplier of new key-value store.
+         * @return the state store supplier; never null
          */
-        KeyValueStore<K, V> build();
+        StateStoreSupplier build();
     }
 
     /**
@@ -268,11 +311,21 @@ public class Stores {
      * @param <K> the type of keys
      * @param <V> the type of values
      */
-    public static interface LocalDatabaseKeyValueFactory<K, V> {
+    public interface PersistentKeyValueFactory<K, V> {
+
         /**
-         * Return the new key-value store.
+         * Set the persistent store as a windowed key-value store
+         *
+         * @param retentionPeriod the maximum period of time in milli-second to keep each window in this store
+         * @param numSegments the maximum number of segments for rolling the windowed store
+         * @param retainDuplicates whether or not to retain duplicate data within the window
+         */
+        PersistentKeyValueFactory<K, V> windowed(long retentionPeriod, int numSegments, boolean retainDuplicates);
+
+        /**
+         * Return the instance of StateStoreSupplier of new key-value store.
          * @return the key-value store; never null
          */
-        KeyValueStore<K, V> build();
+        StateStoreSupplier build();
     }
 }

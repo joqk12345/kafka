@@ -36,17 +36,26 @@ public interface StateStore {
     String name();
 
     /**
+     * Initializes this state store
+     */
+    void init(ProcessorContext context, StateStore root);
+
+    /**
      * Flush any cached data
      */
     void flush();
 
     /**
-     * Close the storage engine
+     * Close the storage engine.
+     * Note that this function needs to be idempotent since it may be called
+     * several times on the same state store.
      */
     void close();
 
     /**
-     * If the storage is persistent
+     * Return if the storage is persistent or not.
+     *
+     * @return  {@code true} if the storage is persistent&mdash;{@code false} otherwise
      */
     boolean persistent();
 }

@@ -27,7 +27,12 @@ import org.apache.kafka.test.TestUtils;
 import org.junit.After;
 import org.junit.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class MetadataTest {
 
@@ -128,7 +133,8 @@ public class MetadataTest {
                 Collections.singletonList(new Node(0, "host1", 1000)),
                 Arrays.asList(
                     new PartitionInfo("topic", 0, null, null, null),
-                    new PartitionInfo("topic1", 0, null, null, null))),
+                    new PartitionInfo("topic1", 0, null, null, null)),
+                Collections.<String>emptySet()),
             100);
 
         assertArrayEquals("Metadata got updated with wrong set of topics.",
@@ -154,7 +160,8 @@ public class MetadataTest {
                 Arrays.asList(new Node(0, "host1", 1000)),
                 Arrays.asList(
                     new PartitionInfo("topic", 0, null, null, null),
-                    new PartitionInfo("topic1", 0, null, null, null))),
+                    new PartitionInfo("topic1", 0, null, null, null)),
+                Collections.<String>emptySet()),
             100);
 
         assertEquals("Listener did not update topics list correctly",
@@ -179,7 +186,8 @@ public class MetadataTest {
                 Collections.singletonList(new Node(0, "host1", 1000)),
                 Arrays.asList(
                     new PartitionInfo("topic", 0, null, null, null),
-                    new PartitionInfo("topic1", 0, null, null, null))),
+                    new PartitionInfo("topic1", 0, null, null, null)),
+                Collections.<String>emptySet()),
             100);
 
         metadata.removeListener(listener);
@@ -188,11 +196,75 @@ public class MetadataTest {
                 Arrays.asList(new Node(0, "host1", 1000)),
                 Arrays.asList(
                     new PartitionInfo("topic2", 0, null, null, null),
-                    new PartitionInfo("topic3", 0, null, null, null))),
+                    new PartitionInfo("topic3", 0, null, null, null)),
+                Collections.<String>emptySet()),
             100);
 
         assertEquals("Listener did not update topics list correctly",
             new HashSet<>(Arrays.asList("topic", "topic1")), topics);
+    }
+
+    @Test
+    public void testTopicExpiry() throws Exception {
+        metadata = new Metadata(refreshBackoffMs, metadataExpireMs, true);
+
+        // Test that topic is expired if not used within the expiry interval
+        long time = 0;
+        metadata.add("topic1");
+        metadata.update(Cluster.empty(), time);
+        time += Metadata.TOPIC_EXPIRY_MS;
+        metadata.update(Cluster.empty(), time);
+        assertFalse("Unused topic not expired", metadata.containsTopic("topic1"));
+
+        // Test that topic is not expired if used within the expiry interval
+        metadata.add("topic2");
+        metadata.update(Cluster.empty(), time);
+        for (int i = 0; i < 3; i++) {
+            time += Metadata.TOPIC_EXPIRY_MS / 2;
+            metadata.update(Cluster.empty(), time);
+            assertTrue("Topic expired even though in use", metadata.containsTopic("topic2"));
+            metadata.add("topic2");
+        }
+
+        // Test that topics added using setTopics expire
+        HashSet<String> topics = new HashSet<>();
+        topics.add("topic4");
+        metadata.setTopics(topics);
+        metadata.update(Cluster.empty(), time);
+        time += Metadata.TOPIC_EXPIRY_MS;
+        metadata.update(Cluster.empty(), time);
+        assertFalse("Unused topic not expired", metadata.containsTopic("topic4"));
+    }
+
+    @Test
+    public void testNonExpiringMetadata() throws Exception {
+        metadata = new Metadata(refreshBackoffMs, metadataExpireMs, false);
+
+        // Test that topic is not expired if not used within the expiry interval
+        long time = 0;
+        metadata.add("topic1");
+        metadata.update(Cluster.empty(), time);
+        time += Metadata.TOPIC_EXPIRY_MS;
+        metadata.update(Cluster.empty(), time);
+        assertTrue("Unused topic expired when expiry disabled", metadata.containsTopic("topic1"));
+
+        // Test that topic is not expired if used within the expiry interval
+        metadata.add("topic2");
+        metadata.update(Cluster.empty(), time);
+        for (int i = 0; i < 3; i++) {
+            time += Metadata.TOPIC_EXPIRY_MS / 2;
+            metadata.update(Cluster.empty(), time);
+            assertTrue("Topic expired even though in use", metadata.containsTopic("topic2"));
+            metadata.add("topic2");
+        }
+
+        // Test that topics added using setTopics don't expire
+        HashSet<String> topics = new HashSet<>();
+        topics.add("topic4");
+        metadata.setTopics(topics);
+        time += metadataExpireMs * 2;
+        metadata.update(Cluster.empty(), time);
+        assertTrue("Unused topic expired when expiry disabled", metadata.containsTopic("topic4"));
     }
 
     private Thread asyncFetch(final String topic) {

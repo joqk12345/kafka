@@ -17,40 +17,46 @@
 
 package org.apache.kafka.test;
 
-import org.apache.kafka.streams.StreamingMetrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsMetrics;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateRestoreCallback;
 import org.apache.kafka.streams.processor.StateStore;
-import org.apache.kafka.common.serialization.Deserializer;
-import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.internals.RecordCollector;
+import org.apache.kafka.streams.state.StateSerdes;
 
 import java.io.File;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class MockProcessorContext implements ProcessorContext, RecordCollector.Supplier {
 
     private final KStreamTestDriver driver;
-    private final Serializer keySerializer;
-    private final Serializer valueSerializer;
-    private final Deserializer keyDeserializer;
-    private final Deserializer valueDeserializer;
+    private final Serde<?> keySerde;
+    private final Serde<?> valSerde;
     private final RecordCollector.Supplier recordCollectorSupplier;
+    private final File stateDir;
 
     private Map<String, StateStore> storeMap = new HashMap<>();
+    private Map<String, StateRestoreCallback> restoreFuncs = new HashMap<>();
 
     long timestamp = -1L;
 
-    public MockProcessorContext(KStreamTestDriver driver, Serializer<?> serializer, Deserializer<?> deserializer) {
-        this(driver, serializer, deserializer, serializer, deserializer, (RecordCollector.Supplier) null);
+    public MockProcessorContext(StateSerdes<?, ?> serdes, RecordCollector collector) {
+        this(null, null, serdes.keySerde(), serdes.valueSerde(), collector);
     }
 
-    public MockProcessorContext(KStreamTestDriver driver, Serializer<?> keySerializer, Deserializer<?> keyDeserializer,
-            Serializer<?> valueSerializer, Deserializer<?> valueDeserializer,
-            final RecordCollector collector) {
-        this(driver, keySerializer, keyDeserializer, valueSerializer, valueDeserializer,
-                collector == null ? null : new RecordCollector.Supplier() {
+    public MockProcessorContext(KStreamTestDriver driver, File stateDir,
+                                Serde<?> keySerde,
+                                Serde<?> valSerde,
+                                final RecordCollector collector) {
+        this(driver, stateDir, keySerde, valSerde,
+                new RecordCollector.Supplier() {
                     @Override
                     public RecordCollector recordCollector() {
                         return collector;
@@ -58,23 +64,25 @@ public class MockProcessorContext implements ProcessorContext, RecordCollector.S
                 });
     }
 
-    public MockProcessorContext(KStreamTestDriver driver, Serializer<?> keySerializer, Deserializer<?> keyDeserializer,
-            Serializer<?> valueSerializer, Deserializer<?> valueDeserializer,
-            RecordCollector.Supplier collectorSupplier) {
+    public MockProcessorContext(KStreamTestDriver driver, File stateDir,
+                                Serde<?> keySerde,
+                                Serde<?> valSerde,
+                                RecordCollector.Supplier collectorSupplier) {
         this.driver = driver;
-        this.keySerializer = keySerializer;
-        this.valueSerializer = valueSerializer;
-        this.keyDeserializer = keyDeserializer;
-        this.valueDeserializer = valueDeserializer;
+        this.stateDir = stateDir;
+        this.keySerde = keySerde;
+        this.valSerde = valSerde;
         this.recordCollectorSupplier = collectorSupplier;
     }
 
     @Override
     public RecordCollector recordCollector() {
-        if (recordCollectorSupplier == null) {
+        RecordCollector recordCollector = recordCollectorSupplier.recordCollector();
+
+        if (recordCollector == null) {
             throw new UnsupportedOperationException("No RecordCollector specified");
         }
-        return recordCollectorSupplier.recordCollector();
+        return recordCollector;
     }
 
     public void setTime(long timestamp) {
@@ -82,49 +90,50 @@ public class MockProcessorContext implements ProcessorContext, RecordCollector.S
     }
 
     @Override
-    public int id() {
-        return -1;
+    public TaskId taskId() {
+        return new TaskId(0, 0);
     }
 
     @Override
-    public boolean joinable() {
-        return true;
+    public String applicationId() {
+        return "mockApplication";
     }
 
     @Override
-    public Serializer<?> keySerializer() {
-        return keySerializer;
+    public Serde<?> keySerde() {
+        return this.keySerde;
     }
 
     @Override
-    public Serializer<?> valueSerializer() {
-        return valueSerializer;
-    }
-
-    @Override
-    public Deserializer<?> keyDeserializer() {
-        return keyDeserializer;
-    }
-
-    @Override
-    public Deserializer<?> valueDeserializer() {
-        return valueDeserializer;
+    public Serde<?> valueSerde() {
+        return this.valSerde;
     }
 
     @Override
     public File stateDir() {
-        throw new UnsupportedOperationException("stateDir() not supported.");
+        if (stateDir == null)
+            throw new UnsupportedOperationException("State directory not specified");
+
+        return stateDir;
     }
 
     @Override
-    public StreamingMetrics metrics() {
-        throw new UnsupportedOperationException("metrics() not supported.");
+    public StreamsMetrics metrics() {
+        return new StreamsMetrics() {
+            @Override
+            public Sensor addLatencySensor(String scopeName, String entityName, String operationName, String... tags) {
+                return null;
+            }
+            @Override
+            public void recordLatency(Sensor sensor, long startNs, long endNs) {
+            }
+        };
     }
 
     @Override
-    public void register(StateStore store, StateRestoreCallback func) {
-        if (func != null) throw new UnsupportedOperationException("StateRestoreCallback not supported.");
+    public void register(StateStore store, boolean loggingEnabled, StateRestoreCallback func) {
         storeMap.put(store.name(), store);
+        restoreFuncs.put(store.name(), func);
     }
 
     @Override
@@ -134,7 +143,7 @@ public class MockProcessorContext implements ProcessorContext, RecordCollector.S
 
     @Override
     public void schedule(long interval) {
-        throw new UnsupportedOperationException("schedule() not supported");
+        throw new UnsupportedOperationException("schedule() not supported.");
     }
 
     @Override
@@ -150,23 +159,29 @@ public class MockProcessorContext implements ProcessorContext, RecordCollector.S
     }
 
     @Override
+    @SuppressWarnings("unchecked")
+    public <K, V> void forward(K key, V value, String childName) {
+        driver.forward(key, value, childName);
+    }
+
+    @Override
     public void commit() {
         throw new UnsupportedOperationException("commit() not supported.");
     }
 
     @Override
     public String topic() {
-        throw new UnsupportedOperationException("topic() not supported.");
+        return null;
     }
 
     @Override
     public int partition() {
-        throw new UnsupportedOperationException("partition() not supported.");
+        return -1;
     }
 
     @Override
     public long offset() {
-        throw new UnsupportedOperationException("offset() not supported.");
+        return -1L;
     }
 
     @Override
@@ -174,4 +189,14 @@ public class MockProcessorContext implements ProcessorContext, RecordCollector.S
         return this.timestamp;
     }
 
+    public Map<String, StateStore> allStateStores() {
+        return Collections.unmodifiableMap(storeMap);
+    }
+
+    public void restore(String storeName, List<KeyValue<byte[], byte[]>> changeLog) {
+        StateRestoreCallback restoreCallback = restoreFuncs.get(storeName);
+        for (KeyValue<byte[], byte[]> entry : changeLog) {
+            restoreCallback.restore(entry.key, entry.value);
+        }
+    }
 }

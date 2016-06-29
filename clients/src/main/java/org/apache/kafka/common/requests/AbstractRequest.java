@@ -36,7 +36,8 @@ public abstract class AbstractRequest extends AbstractRequestResponse {
      * Factory method for getting a request object based on ApiKey ID and a buffer
      */
     public static AbstractRequest getRequest(int requestId, int versionId, ByteBuffer buffer) {
-        switch (ApiKeys.forId(requestId)) {
+        ApiKeys apiKey = ApiKeys.forId(requestId);
+        switch (apiKey) {
             case PRODUCE:
                 return ProduceRequest.parse(buffer, versionId);
             case FETCH:
@@ -49,8 +50,8 @@ public abstract class AbstractRequest extends AbstractRequestResponse {
                 return OffsetCommitRequest.parse(buffer, versionId);
             case OFFSET_FETCH:
                 return OffsetFetchRequest.parse(buffer, versionId);
-            case GROUP_METADATA:
-                return GroupMetadataRequest.parse(buffer, versionId);
+            case GROUP_COORDINATOR:
+                return GroupCoordinatorRequest.parse(buffer, versionId);
             case JOIN_GROUP:
                 return JoinGroupRequest.parse(buffer, versionId);
             case HEARTBEAT:
@@ -67,8 +68,17 @@ public abstract class AbstractRequest extends AbstractRequestResponse {
                 return UpdateMetadataRequest.parse(buffer, versionId);
             case LEADER_AND_ISR:
                 return LeaderAndIsrRequest.parse(buffer, versionId);
+            case DESCRIBE_GROUPS:
+                return DescribeGroupsRequest.parse(buffer, versionId);
+            case LIST_GROUPS:
+                return ListGroupsRequest.parse(buffer, versionId);
+            case SASL_HANDSHAKE:
+                return SaslHandshakeRequest.parse(buffer, versionId);
+            case API_VERSIONS:
+                return ApiVersionsRequest.parse(buffer, versionId);
             default:
-                return null;
+                throw new AssertionError(String.format("ApiKey %s is not currently handled in `getRequest`, the " +
+                        "code should be updated to do so.", apiKey));
         }
     }
 }

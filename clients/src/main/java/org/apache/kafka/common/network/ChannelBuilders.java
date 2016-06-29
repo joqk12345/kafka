@@ -13,7 +13,11 @@
 
 package org.apache.kafka.common.network;
 
+import org.apache.kafka.common.config.SslConfigs;
 import org.apache.kafka.common.protocol.SecurityProtocol;
+import org.apache.kafka.common.security.auth.DefaultPrincipalBuilder;
+import org.apache.kafka.common.security.auth.PrincipalBuilder;
+import org.apache.kafka.common.utils.Utils;
 
 import java.util.Map;
 
@@ -27,23 +31,33 @@ public class ChannelBuilders {
      *             it is ignored otherwise
      * @param loginType the loginType, it must be non-null if `securityProtocol` is SASL_*; it is ignored otherwise
      * @param configs client/server configs
+     * @param clientSaslMechanism SASL mechanism if mode is CLIENT, ignored otherwise
+     * @param saslHandshakeRequestEnable flag to enable Sasl handshake requests; disabled only for SASL
+     *             inter-broker connections with inter-broker protocol version < 0.10
      * @return the configured `ChannelBuilder`
      * @throws IllegalArgumentException if `mode` invariants described above is not maintained
      */
-    public static ChannelBuilder create(SecurityProtocol securityProtocol, Mode mode, LoginType loginType, Map<String, ?> configs) {
+    public static ChannelBuilder create(SecurityProtocol securityProtocol,
+                                        Mode mode,
+                                        LoginType loginType,
+                                        Map<String, ?> configs,
+                                        String clientSaslMechanism,
+                                        boolean saslHandshakeRequestEnable) {
         ChannelBuilder channelBuilder;
 
         switch (securityProtocol) {
             case SSL:
                 requireNonNullMode(mode, securityProtocol);
-                channelBuilder = new SSLChannelBuilder(mode);
+                channelBuilder = new SslChannelBuilder(mode);
                 break;
             case SASL_SSL:
             case SASL_PLAINTEXT:
                 requireNonNullMode(mode, securityProtocol);
                 if (loginType == null)
                     throw new IllegalArgumentException("`loginType` must be non-null if `securityProtocol` is `" + securityProtocol + "`");
-                channelBuilder = new SaslChannelBuilder(mode, loginType, securityProtocol);
+                if (mode == Mode.CLIENT && clientSaslMechanism == null)
+                    throw new IllegalArgumentException("`clientSaslMechanism` must be non-null in client mode if `securityProtocol` is `" + securityProtocol + "`");
+                channelBuilder = new SaslChannelBuilder(mode, loginType, securityProtocol, clientSaslMechanism, saslHandshakeRequestEnable);
                 break;
             case PLAINTEXT:
             case TRACE:
@@ -55,6 +69,21 @@ public class ChannelBuilders {
 
         channelBuilder.configure(configs);
         return channelBuilder;
+    }
+
+    /**
+     * Returns a configured `PrincipalBuilder`.
+     */
+    static PrincipalBuilder createPrincipalBuilder(Map<String, ?> configs) {
+        // this is a server-only config so it will always be null on the client
+        Class<?> principalBuilderClass = (Class<?>) configs.get(SslConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG);
+        PrincipalBuilder principalBuilder;
+        if (principalBuilderClass == null)
+            principalBuilder = new DefaultPrincipalBuilder();
+        else
+            principalBuilder = (PrincipalBuilder) Utils.newInstance(principalBuilderClass);
+        principalBuilder.configure(configs);
+        return principalBuilder;
     }
 
     private static void requireNonNullMode(Mode mode, SecurityProtocol securityProtocol) {

@@ -17,7 +17,19 @@
 
 package org.apache.kafka.streams.kstream;
 
+/**
+ * The {@link ValueMapper} interface for mapping an original value to a new value (could be another key-value pair).
+ *
+ * @param <V1>  original value type
+ * @param <V2>  mapped value type
+ */
 public interface ValueMapper<V1, V2> {
 
+    /**
+     * Map the given value to a new value.
+     *
+     * @param value  the value to be mapped
+     * @return       the new value
+     */
     V2 apply(V1 value);
 }

@@ -22,25 +22,32 @@ import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.apache.kafka.common.serialization.IntegerSerializer;
 import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.common.utils.Utils;
-import org.apache.kafka.streams.StreamingConfig;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.processor.StateStoreSupplier;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.test.MockProcessorNode;
 import org.apache.kafka.test.MockSourceNode;
+import org.apache.kafka.test.MockTimestampExtractor;
 import org.junit.Test;
 import org.junit.Before;
 
 import java.io.File;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Properties;
+import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class StreamTaskTest {
@@ -51,30 +58,31 @@ public class StreamTaskTest {
 
     private final TopicPartition partition1 = new TopicPartition("topic1", 1);
     private final TopicPartition partition2 = new TopicPartition("topic2", 1);
-    private final HashSet<TopicPartition> partitions = new HashSet<>(Arrays.asList(partition1, partition2));
+    private final Set<TopicPartition> partitions = Utils.mkSet(partition1, partition2);
 
-    private final MockSourceNode source1 = new MockSourceNode<>(intDeserializer, intDeserializer);
-    private final MockSourceNode source2 = new MockSourceNode<>(intDeserializer, intDeserializer);
+    private final MockSourceNode<Integer, Integer> source1 = new MockSourceNode<>(intDeserializer, intDeserializer);
+    private final MockSourceNode<Integer, Integer> source2 = new MockSourceNode<>(intDeserializer, intDeserializer);
+    private final MockProcessorNode<Integer, Integer>  processor = new MockProcessorNode<>(10L);
+
     private final ProcessorTopology topology = new ProcessorTopology(
-        Arrays.asList((ProcessorNode) source1, (ProcessorNode) source2),
-        new HashMap<String, SourceNode>() {
-            {
-                put("topic1", source1);
-                put("topic2", source2);
-            }
-        });
+            Arrays.asList((ProcessorNode) source1, (ProcessorNode) source2, (ProcessorNode) processor),
+            new HashMap<String, SourceNode>() {
+                {
+                    put("topic1", source1);
+                    put("topic2", source2);
+                }
+            },
+            Collections.<StateStoreSupplier>emptyList()
+    );
 
-    private StreamingConfig createConfig(final File baseDir) throws Exception {
-        return new StreamingConfig(new Properties() {
+    private StreamsConfig createConfig(final File baseDir) throws Exception {
+        return new StreamsConfig(new Properties() {
             {
-                setProperty(StreamingConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
-                setProperty(StreamingConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArrayDeserializer");
-                setProperty(StreamingConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
-                setProperty(StreamingConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArrayDeserializer");
-                setProperty(StreamingConfig.TIMESTAMP_EXTRACTOR_CLASS_CONFIG, "org.apache.kafka.test.MockTimestampExtractor");
-                setProperty(StreamingConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:2171");
-                setProperty(StreamingConfig.BUFFERED_RECORDS_PER_PARTITION_CONFIG, "3");
-                setProperty(StreamingConfig.STATE_DIR_CONFIG, baseDir.getCanonicalPath());
+                setProperty(StreamsConfig.APPLICATION_ID_CONFIG, "stream-task-test");
+                setProperty(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:2171");
+                setProperty(StreamsConfig.BUFFERED_RECORDS_PER_PARTITION_CONFIG, "3");
+                setProperty(StreamsConfig.STATE_DIR_CONFIG, baseDir.getCanonicalPath());
+                setProperty(StreamsConfig.TIMESTAMP_EXTRACTOR_CLASS_CONFIG, MockTimestampExtractor.class.getName());
             }
         });
     }
@@ -90,6 +98,8 @@ public class StreamTaskTest {
     @Before
     public void setup() {
         consumer.assign(Arrays.asList(partition1, partition2));
+        source1.addChild(processor);
+        source2.addChild(processor);
     }
 
     @SuppressWarnings("unchecked")
@@ -97,44 +107,44 @@ public class StreamTaskTest {
     public void testProcessOrder() throws Exception {
         File baseDir = Files.createTempDirectory("test").toFile();
         try {
-            StreamingConfig config = createConfig(baseDir);
-            StreamTask task = new StreamTask(0, consumer, producer, restoreStateConsumer, partitions, topology, config, null);
+            StreamsConfig config = createConfig(baseDir);
+            StreamTask task = new StreamTask(new TaskId(0, 0), "applicationId", partitions, topology, consumer, producer, restoreStateConsumer, config, null);
 
             task.addRecords(partition1, records(
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 10, recordKey, recordValue),
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 20, recordKey, recordValue),
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 30, recordKey, recordValue)
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 10, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 20, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 30, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue)
             ));
 
             task.addRecords(partition2, records(
-                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 25, recordKey, recordValue),
-                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 35, recordKey, recordValue),
-                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 45, recordKey, recordValue)
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 25, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 35, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 45, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue)
             ));
 
-            assertEquals(task.process(), 5);
-            assertEquals(source1.numReceived, 1);
-            assertEquals(source2.numReceived, 0);
+            assertEquals(5, task.process());
+            assertEquals(1, source1.numReceived);
+            assertEquals(0, source2.numReceived);
 
-            assertEquals(task.process(), 4);
-            assertEquals(source1.numReceived, 1);
-            assertEquals(source2.numReceived, 1);
+            assertEquals(4, task.process());
+            assertEquals(2, source1.numReceived);
+            assertEquals(0, source2.numReceived);
 
-            assertEquals(task.process(), 3);
-            assertEquals(source1.numReceived, 2);
-            assertEquals(source2.numReceived, 1);
+            assertEquals(3, task.process());
+            assertEquals(2, source1.numReceived);
+            assertEquals(1, source2.numReceived);
 
-            assertEquals(task.process(), 2);
-            assertEquals(source1.numReceived, 3);
-            assertEquals(source2.numReceived, 1);
+            assertEquals(2, task.process());
+            assertEquals(3, source1.numReceived);
+            assertEquals(1, source2.numReceived);
 
-            assertEquals(task.process(), 1);
-            assertEquals(source1.numReceived, 3);
-            assertEquals(source2.numReceived, 2);
+            assertEquals(1, task.process());
+            assertEquals(3, source1.numReceived);
+            assertEquals(2, source2.numReceived);
 
-            assertEquals(task.process(), 0);
-            assertEquals(source1.numReceived, 3);
-            assertEquals(source2.numReceived, 3);
+            assertEquals(0, task.process());
+            assertEquals(3, source1.numReceived);
+            assertEquals(3, source2.numReceived);
 
             task.close();
 
@@ -148,50 +158,124 @@ public class StreamTaskTest {
     public void testPauseResume() throws Exception {
         File baseDir = Files.createTempDirectory("test").toFile();
         try {
-            StreamingConfig config = createConfig(baseDir);
-            StreamTask task = new StreamTask(1, consumer, producer, restoreStateConsumer, partitions, topology, config, null);
+            StreamsConfig config = createConfig(baseDir);
+            StreamTask task = new StreamTask(new TaskId(1, 1), "applicationId", partitions, topology, consumer, producer, restoreStateConsumer, config, null);
 
             task.addRecords(partition1, records(
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 10, recordKey, recordValue),
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 20, recordKey, recordValue)
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 10, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 20, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue)
             ));
 
             task.addRecords(partition2, records(
-                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 35, recordKey, recordValue),
-                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 45, recordKey, recordValue),
-                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 55, recordKey, recordValue),
-                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 65, recordKey, recordValue)
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 35, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 45, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 55, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 65, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue)
             ));
 
-            assertEquals(task.process(), 5);
-            assertEquals(source1.numReceived, 1);
-            assertEquals(source2.numReceived, 0);
+            assertEquals(5, task.process());
+            assertEquals(1, source1.numReceived);
+            assertEquals(0, source2.numReceived);
 
-            assertEquals(consumer.paused().size(), 1);
+            assertEquals(1, consumer.paused().size());
             assertTrue(consumer.paused().contains(partition2));
 
             task.addRecords(partition1, records(
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 30, recordKey, recordValue),
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 40, recordKey, recordValue),
-                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 50, recordKey, recordValue)
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 30, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 40, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 50, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue)
             ));
 
-            assertEquals(consumer.paused().size(), 2);
+            assertEquals(2, consumer.paused().size());
             assertTrue(consumer.paused().contains(partition1));
             assertTrue(consumer.paused().contains(partition2));
 
-            assertEquals(task.process(), 7);
-            assertEquals(source1.numReceived, 1);
-            assertEquals(source2.numReceived, 1);
+            assertEquals(7, task.process());
+            assertEquals(2, source1.numReceived);
+            assertEquals(0, source2.numReceived);
 
-            assertEquals(consumer.paused().size(), 1);
-            assertTrue(consumer.paused().contains(partition1));
+            assertEquals(1, consumer.paused().size());
+            assertTrue(consumer.paused().contains(partition2));
 
-            assertEquals(task.process(), 6);
-            assertEquals(source1.numReceived, 2);
-            assertEquals(source2.numReceived, 1);
+            assertEquals(6, task.process());
+            assertEquals(3, source1.numReceived);
+            assertEquals(0, source2.numReceived);
 
-            assertEquals(consumer.paused().size(), 0);
+            assertEquals(1, consumer.paused().size());
+            assertTrue(consumer.paused().contains(partition2));
+
+            assertEquals(5, task.process());
+            assertEquals(3, source1.numReceived);
+            assertEquals(1, source2.numReceived);
+
+            assertEquals(0, consumer.paused().size());
+
+            task.close();
+
+        } finally {
+            Utils.delete(baseDir);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    public void testMaybePunctuate() throws Exception {
+        File baseDir = Files.createTempDirectory("test").toFile();
+        try {
+            StreamsConfig config = createConfig(baseDir);
+            StreamTask task = new StreamTask(new TaskId(0, 0), "applicationId", partitions, topology, consumer, producer, restoreStateConsumer, config, null);
+
+            task.addRecords(partition1, records(
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 20, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 30, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition1.topic(), partition1.partition(), 40, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue)
+            ));
+
+            task.addRecords(partition2, records(
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 25, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 35, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue),
+                    new ConsumerRecord<>(partition2.topic(), partition2.partition(), 45, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, recordKey, recordValue)
+            ));
+
+            assertTrue(task.maybePunctuate());
+
+            assertEquals(5, task.process());
+            assertEquals(1, source1.numReceived);
+            assertEquals(0, source2.numReceived);
+
+            assertFalse(task.maybePunctuate());
+
+            assertEquals(4, task.process());
+            assertEquals(1, source1.numReceived);
+            assertEquals(1, source2.numReceived);
+
+            assertTrue(task.maybePunctuate());
+
+            assertEquals(3, task.process());
+            assertEquals(2, source1.numReceived);
+            assertEquals(1, source2.numReceived);
+
+            assertFalse(task.maybePunctuate());
+
+            assertEquals(2, task.process());
+            assertEquals(2, source1.numReceived);
+            assertEquals(2, source2.numReceived);
+
+            assertTrue(task.maybePunctuate());
+
+            assertEquals(1, task.process());
+            assertEquals(3, source1.numReceived);
+            assertEquals(2, source2.numReceived);
+
+            assertFalse(task.maybePunctuate());
+
+            assertEquals(0, task.process());
+            assertEquals(3, source1.numReceived);
+            assertEquals(3, source2.numReceived);
+
+            assertFalse(task.maybePunctuate());
+
+            processor.supplier.checkAndClearPunctuateResult(20L, 30L, 40L);
 
             task.close();
 

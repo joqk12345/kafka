@@ -15,8 +15,11 @@
 
 from ducktape.services.background_thread import BackgroundThreadService
 
+from kafkatest.directory_layout.kafka_path import KafkaPathResolverMixin
+from kafkatest.services.security.security_config import SecurityConfig
 
-class KafkaLog4jAppender(BackgroundThreadService):
+
+class KafkaLog4jAppender(KafkaPathResolverMixin, BackgroundThreadService):
 
     logs = {
         "producer_log": {
@@ -24,38 +27,51 @@ class KafkaLog4jAppender(BackgroundThreadService):
             "collect_default": False}
     }
 
-    def __init__(self, context, num_nodes, kafka, topic, max_messages=-1):
+    def __init__(self, context, num_nodes, kafka, topic, max_messages=-1, security_protocol="PLAINTEXT"):
         super(KafkaLog4jAppender, self).__init__(context, num_nodes)
 
         self.kafka = kafka
         self.topic = topic
         self.max_messages = max_messages
+        self.security_protocol = security_protocol
+        self.security_config = SecurityConfig(security_protocol)
 
     def _worker(self, idx, node):
-        cmd = self.start_cmd
-        self.logger.debug("VerifiableKafkaLog4jAppender %d command: %s" % (idx, cmd))
+        cmd = self.start_cmd(node)
+        self.logger.debug("VerifiableLog4jAppender %d command: %s" % (idx, cmd))
+        self.security_config.setup_node(node)
         node.account.ssh(cmd)
 
-    @property
-    def start_cmd(self):
-        cmd = "/opt/kafka/bin/kafka-run-class.sh org.apache.kafka.clients.tools.VerifiableLog4jAppender" \
-              " --topic %s --broker-list %s" % (self.topic, self.kafka.bootstrap_servers())
+    def start_cmd(self, node):
+        cmd = self.path.script("kafka-run-class.sh", node)
+        cmd += " org.apache.kafka.tools.VerifiableLog4jAppender"
+        cmd += " --topic %s --broker-list %s" % (self.topic, self.kafka.bootstrap_servers(self.security_protocol))
+
         if self.max_messages > 0:
             cmd += " --max-messages %s" % str(self.max_messages)
+        if self.security_protocol != SecurityConfig.PLAINTEXT:
+            cmd += " --security-protocol %s" % str(self.security_protocol)
+        if self.security_protocol == SecurityConfig.SSL or self.security_protocol == SecurityConfig.SASL_SSL:
+            cmd += " --ssl-truststore-location %s" % str(SecurityConfig.TRUSTSTORE_PATH)
+            cmd += " --ssl-truststore-password %s" % str(SecurityConfig.ssl_stores['ssl.truststore.password'])
+        if self.security_protocol == SecurityConfig.SASL_PLAINTEXT or \
+                self.security_protocol == SecurityConfig.SASL_SSL or \
+                self.security_protocol == SecurityConfig.SASL_MECHANISM_GSSAPI or \
+                self.security_protocol == SecurityConfig.SASL_MECHANISM_PLAIN:
+            cmd += " --sasl-kerberos-service-name %s" % str('kafka')
+            cmd += " --client-jaas-conf-path %s" % str(SecurityConfig.JAAS_CONF_PATH)
+            cmd += " --kerb5-conf-path %s" % str(SecurityConfig.KRB5CONF_PATH)
 
         cmd += " 2>> /mnt/kafka_log4j_appender.log | tee -a /mnt/kafka_log4j_appender.log &"
         return cmd
 
     def stop_node(self, node):
-        node.account.kill_process("VerifiableKafkaLog4jAppender", allow_fail=False)
-        if self.worker_threads is None:
-            return
+        node.account.kill_process("VerifiableLog4jAppender", allow_fail=False)
 
-        # block until the corresponding thread exits
-        if len(self.worker_threads) >= self.idx(node):
-            # Need to guard this because stop is preemptively called before the worker threads are added and started
-            self.worker_threads[self.idx(node) - 1].join()
+        stopped = self.wait_node(node, timeout_sec=self.stop_timeout_sec)
+        assert stopped, "Node %s: did not stop within the specified timeout of %s seconds" % \
+                        (str(node.account), str(self.stop_timeout_sec))
 
     def clean_node(self, node):
-        node.account.kill_process("VerifiableKafkaLog4jAppender", clean_shutdown=False, allow_fail=False)
+        node.account.kill_process("VerifiableLog4jAppender", clean_shutdown=False, allow_fail=False)
         node.account.ssh("rm -rf /mnt/kafka_log4j_appender.log", allow_fail=False)
